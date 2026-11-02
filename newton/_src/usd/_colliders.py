@@ -20,6 +20,7 @@ from ..core.types import Axis
 from ..exceptions import NewtonWarning
 from ..geometry import ShapeFlags
 from ..sim.builder import ModelBuilder
+from ..solvers.mujoco.collision_masks import MUJOCO_COLLISION_MASK_DOMAIN_UNSET, MUJOCO_COLLISION_MASK_UNSET
 from . import utils as usd
 from ._collision_filters import _collect_filtered_pairs
 from ._mass_properties import _is_enabled_collider
@@ -59,6 +60,7 @@ def _parse_colliders(
     path_shape_map: dict[str, int],
     path_shape_scale: dict[str, wp.vec3],
     builder_custom_attr_shape: list[ModelBuilder.CustomAttribute],
+    collision_mask_domain: int,
     bodies_with_visual_shapes: set[int],
     incoming_world_xform: wp.transform,
     usd_axis_to_axis: dict[UsdPhysics.Axis, Axis],
@@ -191,6 +193,11 @@ def _parse_colliders(
                 shape_custom_attrs = usd.get_custom_attribute_values(
                     prim, builder_custom_attr_shape, context={"builder": builder}
                 )
+                if collision_mask_domain != MUJOCO_COLLISION_MASK_DOMAIN_UNSET and all(
+                    shape_custom_attrs.get(key, MUJOCO_COLLISION_MASK_UNSET) != MUJOCO_COLLISION_MASK_UNSET
+                    for key in ("mujoco:contype", "mujoco:conaffinity")
+                ):
+                    shape_custom_attrs["mujoco:collision_mask_domain"] = collision_mask_domain
                 if collect_schema_attrs:
                     R.collect_prim_attrs(prim)
 
