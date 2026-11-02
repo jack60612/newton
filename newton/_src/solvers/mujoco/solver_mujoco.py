@@ -8626,7 +8626,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ``wp.array[wp.transform]``, shape ``[body_count]``.
         """
         ref_qd = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=model.device)
-        ref_body_q = wp.zeros(model.body_count, dtype=wp.transform, device=model.device)
+        # FK only updates articulated bodies; retain standalone static body poses.
+        ref_body_q = wp.clone(model.body_q)
         ref_body_qd = wp.zeros(model.body_count, dtype=wp.spatial_vector, device=model.device)
 
         ref_state = State()

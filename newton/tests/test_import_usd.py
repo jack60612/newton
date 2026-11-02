@@ -10369,6 +10369,95 @@ def Xform "Articulation" (
                     self.assertEqual(solver.mj_model.nv, 12)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_equality_connect_static_reference_anchors(self):
+        """Reference FK must retain non-articulated static endpoint frames."""
+        import mujoco
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        expected_world_anchor = np.array([1.25, 2.5, 3.75])
+        for world_endpoint in (False, True):
+            for reverse in (False, True):
+                with self.subTest(world_endpoint=world_endpoint, reverse=reverse):
+                    stage = Usd.Stage.CreateInMemory()
+                    UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                    UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                    UsdPhysics.Scene.Define(stage, "/physicsScene")
+                    dynamic = UsdGeom.Xform.Define(stage, "/World/Dynamic")
+                    dynamic.AddTranslateOp().Set(Gf.Vec3d(-2.0, 1.0, 0.5))
+                    dynamic.AddRotateYOp().Set(90.0)
+                    UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
+                    mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
+                    mass.CreateMassAttr(1.0)
+                    mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
+                    mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+
+                    # A standalone world-fixed body is not visited by FK.
+                    # Its translated and rotated frame must remain intact.
+                    static = None
+                    if not world_endpoint:
+                        static = UsdGeom.Xform.Define(stage, "/World/Static")
+                        static.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+                        static.AddRotateZOp().Set(90.0)
+                        UsdPhysics.RigidBodyAPI.Apply(static.GetPrim())
+                        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/StaticRoot")
+                        fixed.CreateBody1Rel().SetTargets([static.GetPath()])
+                        fixed.CreateLocalPos0Attr(Gf.Vec3f(1.0, 2.0, 3.0))
+                        sqrt_half = math.sqrt(0.5)
+                        fixed.CreateLocalRot0Attr(Gf.Quatf(sqrt_half, 0.0, 0.0, sqrt_half))
+                        fixed.CreateExcludeFromArticulationAttr(True)
+                    endpoints = [dynamic, static]
+                    if reverse:
+                        endpoints.reverse()
+                    connect = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+                    cache = UsdGeom.XformCache()
+                    for endpoint, relationship, local_position in zip(
+                        endpoints,
+                        (connect.CreateBody0Rel(), connect.CreateBody1Rel()),
+                        (connect.CreateLocalPos0Attr(), connect.CreateLocalPos1Attr()),
+                        strict=True,
+                    ):
+                        point = Gf.Vec3d(*expected_world_anchor)
+                        if endpoint is not None:
+                            relationship.SetTargets([endpoint.GetPath()])
+                            point = cache.GetLocalToWorldTransform(endpoint.GetPrim()).GetInverse().Transform(point)
+                        local_position.Set(Gf.Vec3f(*point))
+                    connect.CreateExcludeFromArticulationAttr(True)
+                    connect.GetPrim().SetMetadata(
+                        "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                    )
+
+                    builder = newton.ModelBuilder()
+                    SolverMuJoCo.register_custom_attributes(builder)
+                    result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
+                    if not world_endpoint:
+                        static_id = result["path_body_map"]["/World/Static"]
+                        self.assertEqual(builder.body_mass[static_id], 0.0)
+                        root_id = result["path_joint_map"]["/World/StaticRoot"]
+                        self.assertEqual(builder.joint_child[root_id], static_id)
+                        self.assertEqual(builder.joint_articulation[root_id], -1)
+                    model = builder.finalize(device="cpu")
+                    warning_context = (
+                        self.assertWarnsRegex(UserWarning, "outside articulations as standalone world roots")
+                        if not world_endpoint
+                        else contextlib.nullcontext()
+                    )
+                    with warning_context:
+                        solver = SolverMuJoCo(model, use_mujoco_cpu=True, njmax=16, nconmax=0)
+                    self.assertEqual(solver.mj_model.neq, 1)
+                    solver.mj_data.qpos[:] = solver.mj_model.qpos0
+                    mujoco.mj_kinematics(solver.mj_model, solver.mj_data)
+                    # Check both the CPU and Warp arrays, not just the stored
+                    # first anchor imported from USD.
+                    for eq_data in (solver.mj_model.eq_data, solver.mjw_model.eq_data.numpy()[0]):
+                        for body_id, anchor in (
+                            (solver.mj_model.eq_obj1id[0], eq_data[0, :3]),
+                            (solver.mj_model.eq_obj2id[0], eq_data[0, 3:6]),
+                        ):
+                            rotation = solver.mj_data.xmat[body_id].reshape(3, 3)
+                            world_anchor = rotation @ anchor + solver.mj_data.xpos[body_id]
+                            np.testing.assert_allclose(world_anchor, expected_world_anchor, atol=2.0e-6, rtol=0.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_equality_connect_site_parsing(self):
         """Test that MjcEqualityConnectAPI on a spherical joint is parsed as a connect equality constraint."""
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
