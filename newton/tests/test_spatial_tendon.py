@@ -716,8 +716,7 @@ def Xform "World" (
             if actuator
             else ""
         )
-        reference = mujoco.MjModel.from_xml_string(
-            f"""<mujoco>
+        mjcf = f"""<mujoco>
   <worldbody>
     <body name="body0" pos="-0.2 0 0.5">
       <joint name="j0" axis="0 0 1"/>
@@ -740,13 +739,33 @@ def Xform "World" (
   </tendon>
   {mjcf_actuator}
 </mujoco>"""
-        )
+        reference = mujoco.MjModel.from_xml_string(mjcf)
         with wp.ScopedDevice("cpu"):
             builder = newton.ModelBuilder()
             SolverMuJoCo.register_custom_attributes(builder)
             builder.add_usd(stage)
             model = builder.finalize()
             solver = SolverMuJoCo(model, use_mujoco_cpu=True)
+            mjcf_builder = newton.ModelBuilder()
+            mjcf_builder.add_mjcf(mjcf, parse_sites=True)
+            mjcf_model = mjcf_builder.finalize()
+            mjcf_solver = SolverMuJoCo(mjcf_model, use_mujoco_cpu=True)
+        for expected_source, expected in (("native", reference), ("add_mjcf", mjcf_solver.mj_model)):
+            for name in (
+                "tendon_adr",
+                "tendon_num",
+                "tendon_limited",
+                "tendon_range",
+                "tendon_stiffness",
+                "tendon_damping",
+                "tendon_lengthspring",
+                "wrap_type",
+            ):
+                with self.subTest(source=expected_source, array=name):
+                    np.testing.assert_array_equal(
+                        np.asarray(getattr(solver.mj_model, name), dtype=np.float32),
+                        np.asarray(getattr(expected, name), dtype=np.float32),
+                    )
         self.assertEqual(model.body_count, 2)
         self.assertEqual(solver.mj_model.nv, 2)
         self.assertEqual(solver.mj_model.ntendon, 1)
@@ -760,7 +779,10 @@ def Xform "World" (
                 np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
         for name in ("tendon_range", "tendon_stiffness", "tendon_damping", "tendon_lengthspring"):
             with self.subTest(array=name):
-                np.testing.assert_allclose(getattr(actual, name), getattr(expected, name), rtol=1e-6, atol=1e-7)
+                np.testing.assert_array_equal(
+                    np.asarray(getattr(actual, name), dtype=np.float32),
+                    np.asarray(getattr(expected, name), dtype=np.float32),
+                )
 
         # USD shape order need not match MJCF. Resolve wrap IDs to source names.
         for i, wrap_type in enumerate(expected.wrap_type):
