@@ -1,0 +1,1 @@
+Expose backend-independent rigid-body picking as `newton.viewer.Picking` with public `apply_forces(state)` for external viewport integrations; replace internal `_apply_picking_force(state)` calls with `apply_forces(state)` while preserving existing force and torque bounds.

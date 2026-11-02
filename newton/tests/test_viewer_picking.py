@@ -7,7 +7,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.viewer.picking import Picking
+from newton.viewer import Picking
 from newton.tests.unittest_utils import add_function_test, assert_np_equal, get_test_devices
 
 
@@ -73,7 +73,7 @@ def _make_model_no_shapes(device=None):
 
 
 class TestPickingSetup(unittest.TestCase):
-    """Tests for the Picking setup (construction, release, pick, update, apply_force)."""
+    """Test picking construction, release, ray selection, targets, and forces."""
 
     def test_init_state(self):
         """Picking initializes with no body picked and default torque behavior."""
@@ -86,6 +86,31 @@ class TestPickingSetup(unittest.TestCase):
         self.assertEqual(picking.pick_damping, 10.0)
         self.assertIsNotNone(picking.pick_state)
         self.assertEqual(picking.pick_state.shape[0], 1)
+
+    def test_public_export(self):
+        """Expose Picking through the supported viewer namespace."""
+        import newton.viewer
+
+        self.assertIn("Picking", newton.viewer.__all__)
+        self.assertIs(newton.viewer.Picking, Picking)
+        self.assertTrue(callable(Picking.apply_forces))
+
+    def test_apply_forces_accumulates_and_release_stops(self):
+        """Accumulate picking forces without clearing existing external forces."""
+        model = _make_single_sphere_model(device="cpu")
+        state = model.state()
+        picking = Picking(model)
+        picking.pick(state, wp.vec3(0.0, 0.0, -2.0), wp.vec3(0.0, 0.0, 1.0))
+        picking.update(wp.vec3(0.5, 0.0, -2.0), wp.vec3(0.0, 0.0, 1.0))
+        state.clear_forces()
+        picking.apply_forces(state)
+        first_force = state.body_f.numpy().copy()
+        self.assertGreater(np.linalg.norm(first_force), 0.0)
+        picking.apply_forces(state)
+        assert_np_equal(state.body_f.numpy(), 2.0 * first_force, tol=1.0e-5)
+        picking.release()
+        picking.apply_forces(state)
+        assert_np_equal(state.body_f.numpy(), 2.0 * first_force, tol=1.0e-5)
 
     def test_release_clears_state(self):
         """release() clears pick_body and sets picking_active to False."""
@@ -183,21 +208,21 @@ class TestPickingSetup(unittest.TestCase):
         self.assertFalse(picking.is_picking())
         self.assertEqual(picking.pick_body.numpy()[0], -1)
 
-    def test_apply_picking_force_when_not_picking(self):
-        """_apply_picking_force() when not picking runs kernel without modifying body_f."""
+    def test_apply_forces_when_not_picking(self):
+        """Apply no force when no body is picked."""
         model = _make_single_sphere_model(device="cpu")
         state = model.state()
         picking = Picking(model)
 
         state.body_f.zero_()
-        picking._apply_picking_force(state)
+        picking.apply_forces(state)
 
         # No body picked -> no force applied
         forces = state.body_f.numpy()
         assert_np_equal(forces, np.zeros_like(forces), tol=1e-9)
 
-    def test_apply_picking_force_when_picking(self):
-        """_apply_picking_force() when picking runs; force is non-zero after update() moves target."""
+    def test_apply_forces_when_picking(self):
+        """Apply a nonzero force after moving the picked target."""
         model = _make_single_sphere_model(device="cpu")
         state = model.state()
         picking = Picking(model)
@@ -211,7 +236,7 @@ class TestPickingSetup(unittest.TestCase):
         # Move target by updating with a ray offset from center so target != attachment point
         picking.update(wp.vec3(0.5, 0.0, -2.0), wp.vec3(0.0, 0.0, 1.0))
         state.body_f.zero_()
-        picking._apply_picking_force(state)
+        picking.apply_forces(state)
 
         forces = state.body_f.numpy()
         self.assertEqual(forces.shape[0], model.body_count)
@@ -257,7 +282,7 @@ def test_picking_setup_device(test: TestPickingSetup, device):
 
     # update and apply_force should not crash
     picking.update(ray_start, ray_dir)
-    picking._apply_picking_force(state)
+    picking.apply_forces(state)
 
     picking.release()
     test.assertFalse(picking.is_picking())
@@ -269,7 +294,7 @@ def _apply_picking_target(picking: Picking, state: newton.State, target: tuple[f
     pick_state[0]["picking_target_world"] = target
     picking.pick_state.assign(pick_state)
     state.body_f.zero_()
-    picking._apply_picking_force(state)
+    picking.apply_forces(state)
     return state.body_f.numpy()[0].copy()
 
 
@@ -373,7 +398,7 @@ def test_picking_torque_limit_cable(test: TestPickingSetup, device):
         pick_state[0]["picking_target_world"] = target
         picking.pick_state.assign(pick_state)
         state_in.clear_forces()
-        picking._apply_picking_force(state_in)
+        picking.apply_forces(state_in)
         solver.step(state_in, state_out, control, None, dt)
         state_in, state_out = state_out, state_in
 
