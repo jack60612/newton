@@ -425,6 +425,9 @@ def parse_usd(
             joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. If False,
             equality constraints are preserved in the ``mujoco:equality_constraint`` custom-attribute namespace
             and finalize under ``model.mujoco.equality_constraint_*``.
+            CONNECT constraints with a world or standalone zero-mass endpoint remain native equalities
+            even when True; they do not create Newton loop joints. Zero-mass bodies owned by an
+            articulation are not treated as standalone static endpoints.
         mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
         schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
             Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.
@@ -4893,6 +4896,19 @@ def parse_usd(
     # builder's collapse logic can remap body/joint indices and adjust anchors/relposes
     # for any bodies that get merged.
     def _parse_mjc_equality_constraints():
+        articulated_bodies = {
+            body
+            for joint, articulation in enumerate(builder.joint_articulation)
+            if articulation >= 0
+            for body in (builder.joint_parent[joint], builder.joint_child[joint])
+        }
+        static_connect_bodies = {
+            body
+            for body, mass in enumerate(builder.body_mass)
+            if mass <= 0.0 and body not in articulated_bodies
+        }
+        static_connect_bodies.add(-1)
+
         def add_converted_loop_joint(
             eq_type: EqType,
             body1: int,
@@ -4970,7 +4986,12 @@ def parse_usd(
                         if (_is_world_target(target0) or target0 in path_body_map)
                         else site0_local_pos
                     )
-                    if convert_mjc_equality_constraints:
+                    # Standalone static/world endpoints have no articulation loop
+                    # target. Preserve their authoritative native equality instead.
+                    convert_connect = convert_mjc_equality_constraints and not (
+                        body0_idx in static_connect_bodies or body1_idx in static_connect_bodies
+                    )
+                    if convert_connect:
                         add_converted_loop_joint(
                             EqType.CONNECT,
                             body0_idx,

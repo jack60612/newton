@@ -4165,6 +4165,9 @@ class ModelBuilder:
                 joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. If False,
                 equality constraints are preserved in the ``mujoco:equality_constraint`` custom-attribute namespace
                 and finalize under ``model.mujoco.equality_constraint_*``.
+                CONNECT constraints with a world or standalone zero-mass endpoint remain native equalities
+                even when True; they do not create Newton loop joints. Zero-mass bodies owned by an
+                articulation are not treated as standalone static endpoints.
             mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
             schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
                 Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.

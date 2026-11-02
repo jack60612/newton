@@ -1,1 +1,2 @@
 Preserve rigid-body ownership and authored mass properties when USD CONNECT equalities reference bodies in different articulations, and retain translated and rotated standalone static endpoint frames when computing reference-pose anchors.
+Keep USD CONNECT constraints with world or standalone zero-mass endpoints as native MuJoCo equalities under default import, avoiding unsupported orphan loop joints while retaining converted loops between articulated bodies.

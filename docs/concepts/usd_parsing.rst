@@ -76,8 +76,13 @@ MuJoCo CONNECT anchors
 endpoints on standalone static bodies with translated or rotated USD frames.
 SolverMuJoCo derives the second anchor at the reference joint configuration,
 retaining the imported poses of static bodies that are not visited by forward
-kinematics. Use native equality import
-(``convert_mjc_equality_constraints=False``) for these standalone static endpoints.
+kinematics. CONNECT constraints with a world or standalone zero-mass endpoint
+remain native SolverMuJoCo equalities even with the default
+``convert_mjc_equality_constraints=True``; no Newton loop joint is created for
+them. Dynamic-body CONNECT constraints retain loop-joint conversion.
+Zero-mass helper bodies inside articulations are not classified as standalone
+static endpoints. No explicit SolverMuJoCo custom-attribute registration is
+required before importing these native equality rows.
 
 Particle Simulation Geometry
 ----------------------------
