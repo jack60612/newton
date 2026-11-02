@@ -85,6 +85,11 @@ conversion. Bodies inside articulations are not classified as standalone static
 endpoints. No explicit SolverMuJoCo custom-attribute registration is required
 before importing these native equality rows.
 
+Site targets within rigid bodies are resolved in double precision before their
+local anchor is stored as a native float32 vector. This avoids subtracting
+already-rounded world positions and preserves small authored offsets under
+translated, rotated, or scaled ancestors.
+
 Static ``UsdGeom.Xformable`` endpoint prims and sites without a rigid-body
 ancestor resolve to world while retaining their relationship targets. Their
 anchors include the composed USD affine transform (including referenced root
