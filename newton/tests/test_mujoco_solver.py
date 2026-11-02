@@ -4618,7 +4618,12 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
             self.skipTest(f"MuJoCo or deps not installed. Skipping test: {e}")
 
         self.assertGreaterEqual(solver.mjw_data.naconmax, model.rigid_contact_max)
-        self.assertEqual(solver.mjw_data.njmax, baseline_solver.mjw_data.njmax)
+        # Native sphere-plane collision has one contact, while Newton's
+        # conservative primitive-pair budget reserves five. Both allocations
+        # are per world, not multiplied by the 64 cloned worlds.
+        self.assertEqual(baseline_solver.mjw_data.njmax, 4)
+        self.assertEqual(solver.mjw_data.njmax, 20)
+        self.assertGreaterEqual(solver.mjw_data.njmax, baseline_solver.mjw_data.njmax)
 
     def test_sphere_rolls_without_slip_with_newton_contacts(self):
         radius = 0.1

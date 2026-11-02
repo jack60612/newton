@@ -33,6 +33,40 @@ section at the bottom collects the most useful anchor points.
    GPU-resident analogues.
 
 
+Constraint and contact storage
+------------------------------
+
+With ``njmax=None`` and ``nconmax=None``, the MuJoCo-Warp backend allocates
+storage once, before generated-kernel preparation and graph capture, from the
+finalized rigid scene. Constraint rows include inactive equalities, joint and
+tendon limits, friction loss, and all eligible native collision pairs' maximum
+manifolds. Contact dimensions respect explicit pairs and geom priorities;
+elliptic and pyramidal cones have different row counts. Native collision
+filtering, including exclusions and sensor-only pairs, determines eligibility.
+Broadphase candidates also use buffers capped by ``nconmax``, so the allocation
+is at least the candidate-pair count even when some pairs have no narrowphase
+dispatch (for example, plane-heightfield). These no-op pairs add no constraint
+rows. The allocation is per world; the shared contact buffer holds
+``nconmax * nworld`` points.
+
+This is a worst-case topology bound, not a prediction of simultaneous contacts.
+It can be expensive for dense collision graphs. Explicit integer capacities
+remain available for workloads with tighter known bounds, and are preserved
+unless smaller than the initial native state requires (which emits a warning).
+With Newton-generated contacts, the contact allocation instead follows
+Newton's collision budget, while structural rows still include future limits
+and equalities. The automatic policy does not resize during stepping.
+
+The bound assumes unchanged topology, collision eligibility, contact dimensions,
+collision algorithm flags, and positive-friction/limited status. Reconstruct the
+solver or provide appropriate explicit budgets if changing these can increase
+storage needs. Flex models are outside the rigid topology estimator's scope.
+For compatibility with pinned MuJoCo-Warp, one extra row protects exactly-fitting
+CONNECT/WELD blocks, and a scene with no physical rows still allocates one row.
+Sparse Jacobian storage continues to use the native estimator and Newton's
+existing joint-limit correction.
+
+
 Joint types
 -----------
 
