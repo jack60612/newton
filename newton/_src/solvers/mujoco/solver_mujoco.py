@@ -749,6 +749,57 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ]
 
     @staticmethod
+    def _expand_mjc_tendon_wrap_rows(prim, context: dict[str, Any]) -> Iterable[dict[str, Any]]:
+        """Lower an indexed USD spatial tendon path to MuJoCo wrap rows."""
+        builder = context.get("builder")
+        if not isinstance(builder, ModelBuilder) or prim.GetAttribute("mjc:type").Get() != "spatial":
+            return []
+
+        def values(name):
+            attribute = prim.GetAttribute(name)
+            value = attribute.Get() if attribute else None
+            return list(value) if value is not None else []
+
+        path = prim.GetRelationship("mjc:path").GetTargets()
+        indices = values("mjc:path:indices") or list(range(len(path)))
+        segments = values("mjc:path:segments") or [0] * len(indices)
+        divisors = values("mjc:path:divisors") or [1.0]
+        side_rel = prim.GetRelationship("mjc:sideSites")
+        side_sites = side_rel.GetTargets() if side_rel else []
+        side_indices = values("mjc:sideSites:indices")
+        shapes = {label: index for index, label in enumerate(builder.shape_label)}
+        rows = []
+        current_segment = 0
+        for i, path_index in enumerate(indices):
+            segment = int(segments[i])
+            if segment < current_segment or segment >= len(divisors):
+                raise ValueError(f"MjcTendon {prim.GetPath()} has invalid path segment {segment}")
+            while current_segment < segment:
+                current_segment += 1
+                rows.append({"mujoco:tendon_wrap_type": 2, "mujoco:tendon_wrap_prm": float(divisors[current_segment])})
+            if i == 0 and float(divisors[0]) != 1.0:
+                rows.append({"mujoco:tendon_wrap_type": 2, "mujoco:tendon_wrap_prm": float(divisors[0])})
+            target = str(path[int(path_index)])
+            if target not in shapes:
+                raise ValueError(f"MjcTendon {prim.GetPath()} references unknown shape {target}")
+            shape = shapes[target]
+            side_index = int(side_indices[i]) if i < len(side_indices) else -1
+            side_shape = -1
+            if side_index >= 0:
+                side_target = str(side_sites[side_index])
+                if side_target not in shapes:
+                    raise ValueError(f"MjcTendon {prim.GetPath()} references unknown side site {side_target}")
+                side_shape = shapes[side_target]
+            rows.append(
+                {
+                    "mujoco:tendon_wrap_type": 0 if builder.shape_flags[shape] & ShapeFlags.SITE else 1,
+                    "mujoco:tendon_wrap_shape": shape,
+                    "mujoco:tendon_wrap_sidesite": side_shape,
+                }
+            )
+        return rows
+
+    @staticmethod
     def _dense_custom_attribute_values(builder: ModelBuilder, key: str) -> list[Any]:
         """Return a default-filled list for one custom-frequency attribute."""
         attribute = builder.custom_attributes[key]
@@ -1018,6 +1069,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             ModelBuilder.CustomFrequency(
                 name="tendon_wrap",
                 namespace="mujoco",
+                usd_prim_filter=cls._is_mjc_tendon_prim,
+                usd_entry_expander=cls._expand_mjc_tendon_wrap_rows,
                 articulation_owner_attribute="mujoco:tendon_wrap_articulation",
                 articulation_owner_resolver=cls._resolve_mujoco_tendon_wrap_owners,
             )
@@ -2738,6 +2791,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dtype=wp.int32,
                 default=0,
                 namespace="mujoco",
+                usd_attribute_name="mjc:type",
+                usd_value_transformer=lambda value, _: int(str(value) == "spatial"),
             )
         )
         # Addressing into wrap path arrays (one per tendon, used by spatial tendons)
@@ -2749,6 +2804,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 default=0,
                 namespace="mujoco",
                 references="mujoco:tendon_wrap",
+                usd_attribute_name="*",
+                usd_value_transformer=lambda _, context: resolve_context_builder(context)._custom_frequency_counts.get(
+                    "mujoco:tendon_wrap", 0
+                ),
             )
         )
         builder.add_custom_attribute(
@@ -2758,6 +2817,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 dtype=wp.int32,
                 default=0,
                 namespace="mujoco",
+                usd_attribute_name="*",
+                usd_value_transformer=lambda _, context: len(
+                    cls._expand_mjc_tendon_wrap_rows(context["prim"], context)
+                ),
             )
         )
 

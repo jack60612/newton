@@ -5,6 +5,7 @@ import unittest
 import warnings
 
 import numpy as np
+import warp as wp
 
 import newton
 from newton.selection import ArticulationView
@@ -593,6 +594,251 @@ class TestMujocoSpatialTendon(unittest.TestCase):
             self.assertGreater(len(wrap_warnings), 0, "Expected a warning about out-of-bounds wrap range")
             # The tendon should have been skipped
             self.assertEqual(solver.mj_model.ntendon, 0)
+
+
+class TestUSDSpatialTendon(unittest.TestCase):
+    """Compare synthetic USD tendon imports with native MuJoCo compilation."""
+
+    @classmethod
+    def setUpClass(cls):
+        try:
+            from pxr import Usd  # noqa: F401
+        except ImportError:
+            raise unittest.SkipTest("Requires usd-core") from None
+
+    def _compile_models(self, usd_path, mjcf_path, *, actuator=False):
+        import mujoco
+        from pxr import Usd
+
+        # USDA text permits the unregistered MjcSiteAPI without schema plugins.
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+(
+    metersPerUnit = 1
+    upAxis = "Z"
+)
+def Xform "World" (
+    prepend apiSchemas = ["PhysicsArticulationRootAPI"]
+)
+{
+    def Xform "body0" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 1
+        float3 physics:diagonalInertia = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (-0.2, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Sphere "s0" (prepend apiSchemas = ["MjcSiteAPI"])
+        {
+            double radius = 0.01
+            double3 xformOp:translate = (-0.1, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Sphere "wrap_geom" (prepend apiSchemas = ["PhysicsCollisionAPI"])
+        {
+            double radius = 0.03
+            double3 xformOp:translate = (0.1, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+        def Sphere "side" (prepend apiSchemas = ["MjcSiteAPI"])
+        {
+            double radius = 0.01
+            double3 xformOp:translate = (0.1, 0.04, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+    def Xform "body1" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    )
+    {
+        float physics:mass = 1
+        float3 physics:diagonalInertia = (0.01, 0.01, 0.01)
+        double3 xformOp:translate = (0.2, 0, 0.5)
+        uniform token[] xformOpOrder = ["xformOp:translate"]
+        def Sphere "s1" (prepend apiSchemas = ["MjcSiteAPI"])
+        {
+            double radius = 0.01
+            double3 xformOp:translate = (0.1, 0, 0)
+            uniform token[] xformOpOrder = ["xformOp:translate"]
+        }
+    }
+    def PhysicsRevoluteJoint "j0"
+    {
+        uniform token physics:axis = "Z"
+        rel physics:body1 = </World/body0>
+        point3f physics:localPos0 = (-0.2, 0, 0.5)
+    }
+    def PhysicsRevoluteJoint "j1"
+    {
+        uniform token physics:axis = "Z"
+        rel physics:body1 = </World/body1>
+        point3f physics:localPos0 = (0.2, 0, 0.5)
+    }
+}
+"""
+        )
+        from pxr import Sdf
+
+        # Author before the tendon to exercise deferred transmission resolution.
+        if actuator:
+            act = stage.DefinePrim("/World/actuator", "MjcActuator")
+            act.CreateRelationship("mjc:target").SetTargets([Sdf.Path("/World/tendon")])
+            for name, value in (("gainType", "affine"), ("biasType", "affine")):
+                act.CreateAttribute(f"mjc:{name}", Sdf.ValueTypeNames.Token).Set(value)
+            for name, value in (
+                ("gainPrm", [7, 0.3, -0.2, 0, 0, 0, 0, 0, 0, 0]),
+                ("biasPrm", [0.4, -5, -0.6, 0, 0, 0, 0, 0, 0, 0]),
+                ("gear", [2, 0, 0, 0, 0, 0]),
+            ):
+                act.CreateAttribute(f"mjc:{name}", Sdf.ValueTypeNames.DoubleArray).Set(value)
+
+        tendon = stage.DefinePrim("/World/tendon", "MjcTendon")
+        tendon.CreateAttribute("mjc:type", Sdf.ValueTypeNames.Token).Set("spatial")
+        for name, value_type, value in (
+            ("stiffness", Sdf.ValueTypeNames.Double, 37.0),
+            ("damping", Sdf.ValueTypeNames.Double, 2.5),
+            ("limited", Sdf.ValueTypeNames.Token, "true"),
+            ("range:min", Sdf.ValueTypeNames.Double, 0.1),
+            ("range:max", Sdf.ValueTypeNames.Double, 1.2),
+            ("springlength", Sdf.ValueTypeNames.DoubleArray, [0.2, 0.3]),
+        ):
+            tendon.CreateAttribute(f"mjc:{name}", value_type).Set(value)
+        usd_path(tendon)
+
+        mjcf_actuator = (
+            """
+  <actuator>
+    <general name="actuator" tendon="tendon" gaintype="affine" biastype="affine"
+             gainprm="7 0.3 -0.2" biasprm="0.4 -5 -0.6" gear="2"/>
+  </actuator>"""
+            if actuator
+            else ""
+        )
+        reference = mujoco.MjModel.from_xml_string(
+            f"""<mujoco>
+  <worldbody>
+    <body name="body0" pos="-0.2 0 0.5">
+      <joint name="j0" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
+      <site name="s0" pos="-0.1 0 0"/>
+      <geom name="wrap_geom" type="sphere" size="0.03" pos="0.1 0 0"/>
+      <site name="side" pos="0.1 0.04 0"/>
+    </body>
+    <body name="body1" pos="0.2 0 0.5">
+      <joint name="j1" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.01 0.01 0.01"/>
+      <site name="s1" pos="0.1 0 0"/>
+    </body>
+  </worldbody>
+  <tendon>
+    <spatial name="tendon" stiffness="37" damping="2.5" limited="true"
+             range="0.1 1.2" springlength="0.2 0.3">
+      {mjcf_path}
+    </spatial>
+  </tendon>
+  {mjcf_actuator}
+</mujoco>"""
+        )
+        with wp.ScopedDevice("cpu"):
+            builder = newton.ModelBuilder()
+            SolverMuJoCo.register_custom_attributes(builder)
+            builder.add_usd(stage)
+            model = builder.finalize()
+            solver = SolverMuJoCo(model, use_mujoco_cpu=True)
+        self.assertEqual(model.body_count, 2)
+        self.assertEqual(solver.mj_model.nv, 2)
+        self.assertEqual(solver.mj_model.ntendon, 1)
+        return model, solver.mj_model, reference
+
+    def _assert_tendon_parity(self, actual, expected):
+        import mujoco
+
+        for name in ("tendon_adr", "tendon_num", "tendon_limited", "wrap_type"):
+            with self.subTest(array=name):
+                np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+        for name in ("tendon_range", "tendon_stiffness", "tendon_damping", "tendon_lengthspring"):
+            with self.subTest(array=name):
+                np.testing.assert_allclose(getattr(actual, name), getattr(expected, name), rtol=1e-6, atol=1e-7)
+
+        # USD shape order need not match MJCF. Resolve wrap IDs to source names.
+        for i, wrap_type in enumerate(expected.wrap_type):
+            with self.subTest(wrap=i):
+                if wrap_type == mujoco.mjtWrap.mjWRAP_PULLEY:
+                    self.assertEqual(actual.wrap_objid[i], expected.wrap_objid[i])
+                    self.assertAlmostEqual(actual.wrap_prm[i], expected.wrap_prm[i])
+                    continue
+                obj_type = (
+                    mujoco.mjtObj.mjOBJ_SITE if wrap_type == mujoco.mjtWrap.mjWRAP_SITE else mujoco.mjtObj.mjOBJ_GEOM
+                )
+                actual_name = mujoco.mj_id2name(actual, obj_type, actual.wrap_objid[i])
+                expected_name = mujoco.mj_id2name(expected, obj_type, expected.wrap_objid[i])
+                self.assertEqual(actual_name.rsplit("/", 1)[-1].rsplit("_", 1)[0], expected_name)
+                if obj_type == mujoco.mjtObj.mjOBJ_GEOM and expected.wrap_prm[i] >= 0:
+                    actual_side = mujoco.mj_id2name(actual, mujoco.mjtObj.mjOBJ_SITE, int(actual.wrap_prm[i]))
+                    expected_side = mujoco.mj_id2name(expected, mujoco.mjtObj.mjOBJ_SITE, int(expected.wrap_prm[i]))
+                    self.assertEqual(actual_side.rsplit("/", 1)[-1].rsplit("_", 1)[0], expected_side)
+                else:
+                    self.assertEqual(actual.wrap_prm[i], expected.wrap_prm[i])
+
+    def test_usd_spatial_tendon_site_path(self):
+        """An unindexed USD site path between moving bodies preserves tendon parameters."""
+        from pxr import Sdf
+
+        def author_path(tendon):
+            tendon.CreateRelationship("mjc:path").SetTargets([Sdf.Path("/World/body0/s0"), Sdf.Path("/World/body1/s1")])
+
+        model, actual, expected = self._compile_models(author_path, '<site site="s0"/><site site="s1"/>')
+        self._assert_tendon_parity(actual, expected)
+        np.testing.assert_array_equal(model.mujoco.tendon_type.numpy(), [1])
+        np.testing.assert_array_equal(model.mujoco.tendon_joint_num.numpy(), [0])
+
+    def test_usd_spatial_tendon_geom_wrap_and_actuator(self):
+        """Indexed geom/sidesite paths and general tendon gain/bias match native MJCF."""
+        from pxr import Sdf
+
+        def author_path(tendon):
+            tendon.CreateRelationship("mjc:path").SetTargets(
+                [
+                    Sdf.Path("/World/body1/s1"),
+                    Sdf.Path("/World/body0/wrap_geom"),
+                    Sdf.Path("/World/body0/s0"),
+                ]
+            )
+            tendon.CreateAttribute("mjc:path:indices", Sdf.ValueTypeNames.IntArray).Set([2, 1, 0])
+            tendon.CreateRelationship("mjc:sideSites").SetTargets([Sdf.Path("/World/body0/side")])
+            tendon.CreateAttribute("mjc:sideSites:indices", Sdf.ValueTypeNames.IntArray).Set([-1, 0, -1])
+
+        model, actual, expected = self._compile_models(
+            author_path, '<site site="s0"/><geom geom="wrap_geom" sidesite="side"/><site site="s1"/>', actuator=True
+        )
+        self._assert_tendon_parity(actual, expected)
+        self.assertEqual(actual.nu, 1)
+        for name in ("actuator_trntype", "actuator_trnid", "actuator_gaintype", "actuator_biastype"):
+            with self.subTest(array=name):
+                np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
+        for name in ("actuator_gainprm", "actuator_biasprm", "actuator_gear"):
+            with self.subTest(array=name):
+                np.testing.assert_allclose(getattr(actual, name), getattr(expected, name), rtol=1e-6, atol=1e-7)
+        np.testing.assert_array_equal(model.mujoco.ctrl_source.numpy(), [int(SolverMuJoCo.CtrlSource.CTRL_DIRECT)])
+
+    def test_usd_spatial_tendon_repeated_indices_and_pulleys(self):
+        """Repeated relationship targets retain path order across pulley segments."""
+        from pxr import Sdf
+
+        def author_path(tendon):
+            tendon.CreateRelationship("mjc:path").SetTargets([Sdf.Path("/World/body0/s0"), Sdf.Path("/World/body1/s1")])
+            tendon.CreateAttribute("mjc:path:indices", Sdf.ValueTypeNames.IntArray).Set([0, 1, 1, 0])
+            tendon.CreateAttribute("mjc:path:segments", Sdf.ValueTypeNames.IntArray).Set([0, 0, 1, 1])
+            tendon.CreateAttribute("mjc:path:divisors", Sdf.ValueTypeNames.DoubleArray).Set([2.0, 3.0])
+
+        _, actual, expected = self._compile_models(
+            author_path,
+            '<pulley divisor="2"/><site site="s0"/><site site="s1"/>'
+            '<pulley divisor="3"/><site site="s1"/><site site="s0"/>',
+        )
+        self._assert_tendon_parity(actual, expected)
 
 
 if __name__ == "__main__":
