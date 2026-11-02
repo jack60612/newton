@@ -2922,6 +2922,15 @@ def parse_usd(
                     joint_descriptions[str(joint_path)].body1,
                 )
             }
+            equality_only_body_paths = {
+                str(body_path)
+                for joint_path in desc.articulatedJoints
+                if str(joint_path) in mjc_equality_connect_or_weld_paths
+                for body_path in (
+                    joint_descriptions[str(joint_path)].body0,
+                    joint_descriptions[str(joint_path)].body1,
+                )
+            } - structural_body_paths
             body_ids = {}
             body_labels = []
             current_body_id = 0
@@ -2937,7 +2946,7 @@ def parse_usd(
                 if key in ignored_body_paths:
                     continue
                 if (
-                    key not in structural_body_paths
+                    key in equality_only_body_paths
                     and key != articulation_path
                     and not key.startswith("/" if articulation_path == "/" else f"{articulation_path}/")
                 ):
