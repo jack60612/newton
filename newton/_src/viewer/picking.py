@@ -15,12 +15,38 @@ from .kernels import PickingState, apply_picking_force_kernel, compute_pick_stat
 
 
 class Picking:
-    """
-    Picking system.
+    """Ray-based rigid-body picking independent of a rendering backend.
 
-    Allows to pick a body in the viewer by right clicking on it and dragging the mouse.
-    This can be used to move objects around in the viewer, a typical use case is to check for solver resilience or
-    see how well a RL policy is coping with disturbances.
+    Call :meth:`pick` with a world-space ray when dragging begins, then
+    :meth:`update` as the ray moves and :meth:`release` when dragging ends.
+    Ray directions must be normalized. Call :meth:`apply_forces` after clearing
+    external forces and before each solver substep, including captured steps.
+
+    The spring-damper force is bounded using the effective mass (the total
+    articulation mass for articulated bodies, or the body's own mass otherwise).
+    Torque is bounded separately using the picked body's mass and inertia.
+    No viewer or window is required.
+
+    External viewports can forward press, drag, and release events to
+    :meth:`pick`, :meth:`update`, and :meth:`release`, respectively. With
+    ``world_offsets``, supply rays in the same offset coordinates displayed
+    by the viewport.
+
+    Example:
+        .. code-block:: python
+
+            from newton.viewer import Picking
+
+            picking = Picking(model, pick_max_acceleration=5.0)
+            # On press: picking.pick(state, ray_start, ray_dir)
+            # On drag: picking.update(ray_start, ray_dir)
+            # On release: picking.release()
+
+            # In each simulation substep:
+            state.clear_forces()
+            picking.apply_forces(state)
+            solver.step(state, next_state, control, contacts, dt)
+            state, next_state = next_state, state
     """
 
     def __init__(
@@ -87,12 +113,16 @@ class Picking:
         # to move the whole chain. Free bodies use their own mass.
         self._pick_effective_mass = self._compute_effective_mass(model)
 
-    def _apply_picking_force(self, state: newton.State) -> None:
-        """
-        Applies a force to the picked body.
+    def apply_forces(self, state: newton.State) -> None:
+        """Add the picking force [N] and torque [N·m] to ``state.body_f``.
+
+        Existing forces are preserved. When no body is picked, no force is
+        added. Call after :meth:`~newton.State.clear_forces` and before each
+        solver substep. The force kernel is launched even while inactive so
+        picking can be activated or released after CUDA graph capture.
 
         Args:
-            state: The simulation state.
+            state: The simulation state associated with this picker's model.
         """
         if (
             self.model is None
