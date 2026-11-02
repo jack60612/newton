@@ -127,6 +127,10 @@ class SchemaResolverNewton(SchemaResolver):
         },
         PrimType.JOINT: {
             "armature": SchemaAttribute("newton:armature", 0.0),
+            **{
+                f"{axis}_armature": SchemaAttribute(f"newton:{axis}:armature", None)
+                for axis in ("transX", "transY", "transZ", "rotX", "rotY", "rotZ")
+            },
             "damping": SchemaAttribute("newton:damping", None),
             "friction": SchemaAttribute("newton:friction", 0.0),
             "limit_ke": SchemaAttribute("newton:limitStiffness", None),
@@ -281,7 +285,13 @@ class SchemaResolverNewton(SchemaResolver):
             "mass_model": SchemaAttribute("newton:massModel", "solid"),
             "shell_thickness": SchemaAttribute("newton:shellThickness", float("-inf")),
         },
-        PrimType.BODY: {},
+        PrimType.BODY: {
+            # Configure an imported FREE base joint, never the body's inertia.
+            **{
+                f"{axis}_armature": SchemaAttribute(f"newton:{axis}:armature", None)
+                for axis in ("transX", "transY", "transZ", "rotX", "rotY", "rotZ")
+            },
+        },
         PrimType.ARTICULATION: {
             "self_collision_enabled": SchemaAttribute("newton:selfCollisionEnabled", True),
         },

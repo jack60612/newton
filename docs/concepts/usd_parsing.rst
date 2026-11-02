@@ -37,6 +37,38 @@ Newton's :meth:`newton.ModelBuilder.add_usd` method provides a USD import pipeli
 * Collects solver-specific attributes preserving solver-native attributes for potential use in the solver
 * Supports parsing of custom Newton model/state/control attributes for specialized simulation requirements
 
+Per-axis joint armature
+----------------------
+
+The Newton resolver accepts optional custom float attributes
+``newton:transX:armature``, ``newton:transY:armature``,
+``newton:transZ:armature``, ``newton:rotX:armature``,
+``newton:rotY:armature``, and ``newton:rotZ:armature``.
+On a D6 joint prim, each attribute overrides the resolved scalar joint
+armature for that axis; unauthored axes retain the scalar fallback.
+Only unlocked axes contribute model DOFs.
+
+On a rigid-body prim, these attributes configure its imported FREE base
+joint, when one exists. Unauthored axes retain the FREE joint's zero
+armature. Body-level scalar ``newton:armature`` remains ignored, and no
+armature attribute changes body mass or inertia. Author these values before
+calling :meth:`newton.ModelBuilder.add_usd`; no model-property notification
+is needed after import.
+
+Values use native SI units: kg for translation and kg m² for rotation,
+without degree conversion. Model storage is linear XYZ followed by angular
+XYZ, with independent values in :attr:`newton.Model.joint_armature`.
+For example, a floating rigid body with angular rotors only can author:
+
+.. code-block:: usda
+
+   custom float newton:transX:armature = 0
+   custom float newton:transY:armature = 0
+   custom float newton:transZ:armature = 0
+   custom float newton:rotX:armature = 0.001
+   custom float newton:rotY:armature = 0.002
+   custom float newton:rotZ:armature = 0.004
+
 Particle Simulation Geometry
 ----------------------------
 
