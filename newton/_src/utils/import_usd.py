@@ -2865,7 +2865,6 @@ def parse_usd(
 
         articulation_id = builder.articulation_count
         parent_prim = None
-        body_data = {}
         for path, desc in zip(paths, articulation_descs, strict=False):
             if warn_invalid_desc(path, desc):
                 continue
@@ -2909,6 +2908,20 @@ def parse_usd(
                 )
             if verbose and articulation_custom_attrs:
                 print(f"Extracted articulation custom attributes: {articulation_custom_attrs}")
+            body_data = {}
+            # OpenUSD includes external equality endpoints in articulatedBodies.
+            # They belong to their own articulation, not this kinematic graph.
+            # Consuming their specs here loses their mass/shape mapping and can
+            # reuse another articulation's deferred body arguments.
+            structural_body_paths = {
+                str(body_path)
+                for joint_path in desc.articulatedJoints
+                if str(joint_path) not in mjc_equality_connect_or_weld_paths
+                for body_path in (
+                    joint_descriptions[str(joint_path)].body0,
+                    joint_descriptions[str(joint_path)].body1,
+                )
+            }
             body_ids = {}
             body_labels = []
             current_body_id = 0
@@ -2922,6 +2935,12 @@ def parse_usd(
                     continue
                 key = str(p)
                 if key in ignored_body_paths:
+                    continue
+                if (
+                    key not in structural_body_paths
+                    and key != articulation_path
+                    and not key.startswith("/" if articulation_path == "/" else f"{articulation_path}/")
+                ):
                     continue
 
                 usd_prim = stage.GetPrimAtPath(p)
