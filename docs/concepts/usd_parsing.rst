@@ -113,6 +113,14 @@ Each world-facing joint receives incoming placement and root rebasing; an
 explicit floating/fixed mobility override still applies only to the first root.
 Dynamic-parent joint frames and excluded loop ownership are unchanged.
 
+MuJoCo equality site precision
+------------------------------
+
+Site targets within rigid bodies are resolved in double precision before their
+local anchor is stored as a native float32 vector. This avoids subtracting
+already-rounded world positions and preserves small authored offsets under
+translated, rotated, or scaled ancestors.
+
 Particle Simulation Geometry
 ----------------------------
 
