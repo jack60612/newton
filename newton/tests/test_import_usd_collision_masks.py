@@ -124,10 +124,16 @@ class TestUsdCollisionMasks(unittest.TestCase):
                 body_masks = [[wood] * 112, [wood] * 113] + [[apple] for _ in range(34)]
                 body_masks += [[hardware], [hardware]]
                 stage = self._stage(body_masks)
+                # Compile separated bodies so constructor forward dynamics does
+                # not solve thousands of deliberately overlapping contacts.
+                for body_index in range(36):
+                    UsdGeom.Xformable(stage.GetPrimAtPath(f"/body{body_index}")).AddTranslateOp().Set(
+                        Gf.Vec3d(float(body_index), 0.0, 0.0)
+                    )
                 for index in (36, 37):
                     stage.GetPrimAtPath(f"/body{index}").RemoveAPI(UsdPhysics.RigidBodyAPI)
                 UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0")).CreateFilteredPairsRel().AddTarget(
-                    Sdf.Path("/body36")
+                    Sdf.Path("/body36/shape0")
                 )
                 builder = self._builder()
                 result = builder.add_usd(stage, load_visual_shapes=False)
@@ -147,9 +153,14 @@ class TestUsdCollisionMasks(unittest.TestCase):
                 self.assertEqual(int(model.shape_body.numpy()[wire]), -1)
                 self.assertGreater(int(solver.mj_model.geom_bodyid[shape_to_geom[wire]]), 0)
 
-                # Every sphere overlaps at the origin: absence/presence is a
-                # positive collision-filter control, not a no-contact rest pose.
+                # Then overlap every sphere for collision detection only: verify
+                # all allowed/forbidden pairs without an unrelated dense solve.
+                # Static hardware remains at its compiled origin/BVH throughout.
                 data = mujoco.MjData(solver.mj_model)
+                for joint, kind in enumerate(solver.mj_model.jnt_type):
+                    self.assertEqual(int(kind), int(mujoco.mjtJoint.mjJNT_FREE))
+                    address = int(solver.mj_model.jnt_qposadr[joint])
+                    data.qpos[address : address + 3] = 0.0
                 mujoco.mj_kinematics(solver.mj_model, data)
                 mujoco.mj_collision(solver.mj_model, data)
                 mapping = solver.mjc_geom_to_newton_shape.numpy()[0]
@@ -180,7 +191,7 @@ class TestUsdCollisionMasks(unittest.TestCase):
         UsdGeom.Xformable(stage.GetPrimAtPath("/body0")).AddTranslateOp().Set(Gf.Vec3d(0.0, 2.0, 3.0))
         UsdGeom.Xformable(stage.GetPrimAtPath("/body1")).AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
         UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0")).CreateFilteredPairsRel().AddTarget(
-            Sdf.Path("/body1")
+            Sdf.Path("/body1/shape0")
         )
         connect = UsdPhysics.SphericalJoint.Define(stage, "/connect")
         connect.CreateBody0Rel().SetTargets([Sdf.Path("/body0")])
@@ -188,9 +199,7 @@ class TestUsdCollisionMasks(unittest.TestCase):
         connect.CreateLocalPos0Attr(Gf.Vec3f(1.0, 0.0, 0.0))
         connect.CreateLocalPos1Attr(Gf.Vec3f(0.0, 0.0, 0.0))
         connect.CreateExcludeFromArticulationAttr(True)
-        connect.GetPrim().SetMetadata(
-            "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
-        )
+        connect.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"]))
         builder = self._builder()
         result = builder.add_usd(stage, load_visual_shapes=False)
         model = builder.finalize(device="cpu")
@@ -200,9 +209,7 @@ class TestUsdCollisionMasks(unittest.TestCase):
         np.testing.assert_allclose(solver.mj_model.eq_data[0, 3:6], [1.0, 2.0, 3.0], atol=1.0e-6)
         self.assertEqual(int(solver.mj_model.eq_obj2id[0]), 0)
         wire = result["path_shape_map"]["/body1/shape0"]
-        shape_to_geom = {
-            int(shape): geom for geom, shape in enumerate(solver.mjc_geom_to_newton_shape.numpy()[0])
-        }
+        shape_to_geom = {int(shape): geom for geom, shape in enumerate(solver.mjc_geom_to_newton_shape.numpy()[0])}
         wire_body = int(solver.mj_model.geom_bodyid[shape_to_geom[wire]])
         self.assertGreater(wire_body, 0)
         self.assertEqual(int(solver.mj_model.body_weldid[wire_body]), 0)

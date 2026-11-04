@@ -2494,8 +2494,8 @@ class TestMuJoCoSolverCollisionMasks(unittest.TestCase):
                 )
                 self.assertEqual(actual, expected, f"MuJoCo pair {(shape_a, shape_b)}")
 
-    def test_falls_back_when_exact_masks_exceed_32_bits(self):
-        """Fall back for a graph that provably needs 33 mask bits."""
+    def test_rejects_native_graphs_exceeding_32_bits(self):
+        """Reject unrepresentable native masks while retaining Newton-generated contacts."""
         builder = newton.ModelBuilder()
         for index, group in enumerate(np.repeat(np.arange(1, 34), 2)):
             body = builder.add_link(label=f"body_{index}")
@@ -2504,10 +2504,13 @@ class TestMuJoCoSolverCollisionMasks(unittest.TestCase):
             cfg = newton.ModelBuilder.ShapeConfig(collision_group=int(group))
             builder.add_shape_sphere(body, radius=0.1, cfg=cfg, label=f"shape_{index}")
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", message=r"The selected Newton collision graph.*")
-            solver = SolverMuJoCo(builder.finalize(device="cpu"), use_mujoco_contacts=True)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "Cannot represent Newton collision filters exactly"):
+            SolverMuJoCo(model, use_mujoco_contacts=True, use_mujoco_cpu=True)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, use_mujoco_cpu=True)
         self.assertEqual(solver.mj_model.ngeom, 66)
+        self.assertTrue(np.all(solver.mj_model.geom_contype == 0))
+        self.assertTrue(np.all(solver.mj_model.geom_conaffinity == 0))
 
 
 class TestMuJoCoSolverGeomProperties(TestMuJoCoSolverPropertiesBase):
@@ -6976,6 +6979,7 @@ class TestMuJoCoAttributes(unittest.TestCase):
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_custom_attributes_from_usd(self):
+        """Import custom geometry metadata with supported standalone world roots."""
         from pxr import Sdf, Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.CreateInMemory()
@@ -7000,8 +7004,7 @@ class TestMuJoCoAttributes(unittest.TestCase):
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.add_usd(stage)
         model = builder.finalize()
-        with self.assertWarnsRegex(UserWarning, "standalone world roots"):
-            solver = SolverMuJoCo(model, separate_worlds=False)
+        solver = SolverMuJoCo(model, separate_worlds=False)
         assert hasattr(model, "mujoco")
         assert hasattr(model.mujoco, "condim")
         assert np.allclose(model.mujoco.condim.numpy(), [6])

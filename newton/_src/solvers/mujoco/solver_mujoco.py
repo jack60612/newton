@@ -113,6 +113,7 @@ from .kernels import (
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
 )
+from .sizing import _scene_constraint_capacity, _structural_constraint_rows
 from .utils import solref_invalid_mask
 
 if TYPE_CHECKING:
@@ -5438,9 +5439,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         return [(selected_bodies[bodies_a[k]], selected_bodies[bodies_b[k]]) for k in np.flatnonzero(excluded)]
 
     @staticmethod
-    def _find_static_collision_filter_pairs(
-        model: Model, selected_shapes: np.ndarray
-    ) -> list[tuple[int, int]]:
+    def _find_static_collision_filter_pairs(model: Model, selected_shapes: np.ndarray) -> list[tuple[int, int]]:
         """Find world-owned shape/whole-body filters representable as native excludes."""
         shape_body = model.shape_body.numpy()
         if not np.any(shape_body[selected_shapes] < 0):
@@ -7845,8 +7844,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 nworld = model.world_count
             else:
                 nworld = 1
-
-            from .sizing import _scene_constraint_capacity, _structural_constraint_rows
 
             if disable_contacts:
                 nconmax = 0
