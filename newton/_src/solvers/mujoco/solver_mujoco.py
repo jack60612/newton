@@ -135,6 +135,7 @@ from .kernels import (
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
 )
+from .sizing import _scene_constraint_capacity, _structural_constraint_rows
 from .utils import solref_invalid_mask
 
 if TYPE_CHECKING:
@@ -4464,15 +4465,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         Args:
             model: The model to be simulated.
             separate_worlds: If True, each Newton world is mapped to a separate MuJoCo world. Defaults to `not use_mujoco_cpu`.
-            njmax: Maximum number of constraints per world. If None, a default
-                value is estimated automatically. An explicit value is preserved
-                unless it cannot hold the initial MuJoCo constraints; in that case,
-                it is increased with a warning.
+            njmax: Maximum number of constraints per world. If None, reserves
+                potential equality, limit, friction and contact rows from the
+                finalized topology. An explicit value is preserved unless it
+                cannot hold the initial MuJoCo constraints; then it is increased
+                with a warning.
             njmax_nnz: Sparse constraint Jacobian nonzero capacity per world. If provided, must be non-negative and large enough for the initial sparse Jacobian. If None, derived from the model's constraint counts and njmax, plus friction nonzeros for every DOF and tendon.
-            nconmax: Number of contact points per world. If None, a default value
-                is estimated automatically. An explicit value is preserved unless
-                it cannot hold the initial MuJoCo contacts; in that case, it is
-                increased with a warning. With ``use_mujoco_cpu=True``, this limits contact
+            nconmax: Number of contact points per world. If None, reserves the
+                native collision pairs' manifold bounds, or Newton's collision
+                budget when use_mujoco_contacts=False. An explicit value is
+                preserved unless it cannot hold the initial MuJoCo contacts;
+                then it is increased with a warning. With ``use_mujoco_cpu=True``, this limits contact
                 export rather than simulation; excess runtime contacts are omitted
                 from the export with a warning.
             iterations: Number of solver iterations. If None, uses model custom attribute or MuJoCo's default (100).
@@ -9531,9 +9534,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 nworld = 1
 
             njmax_requested = njmax
-            # TODO find better heuristics to determine nconmax and njmax
             if disable_contacts:
                 nconmax = 0
+                if njmax is None:
+                    njmax = max(1, _structural_constraint_rows(self.mj_model))
             elif not self._use_mujoco_contacts:
                 if nconmax is None:
                     # The initialization forward intentionally produces no contacts
@@ -9542,8 +9546,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     nconmax = (newton_contact_max + nworld - 1) // nworld
 
                 if njmax is None:
-                    from mujoco_warp._src.io import _default_njmax as estimate_mujoco_warp_njmax
-
                     max_contact_dim = max(
                         1,
                         int(np.max(self.mj_model.geom_condim, initial=1)),
@@ -9561,10 +9563,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     # topology rather than duplicating the global capacity.
                     per_world_contact_max = _estimate_rigid_contact_max_per_world(model, nconmax * nworld)
                     njmax = max(
-                        estimate_mujoco_warp_njmax(self.mj_model, self.mj_data),
-                        self.mj_data.nefc + per_world_contact_max * constraint_rows_per_contact,
+                        1,
+                        _structural_constraint_rows(self.mj_model)
+                        + per_world_contact_max * constraint_rows_per_contact,
                     )
-            elif nconmax is not None and nconmax < self.mj_data.ncon:
+            elif njmax is None or nconmax is None:
+                scene_njmax, scene_nconmax = _scene_constraint_capacity(self.mj_model, self.mjw_model)
+                if njmax is None:
+                    njmax = scene_njmax
+                if nconmax is None:
+                    nconmax = scene_nconmax
+
+            if self._use_mujoco_contacts and nconmax is not None and nconmax < self.mj_data.ncon:
                 warnings.warn(
                     f"[WARNING] Value for nconmax is changed from {nconmax} to {self.mj_data.ncon} following an MjWarp requirement.",
                     NewtonWarning,
