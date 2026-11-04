@@ -400,7 +400,9 @@ def parse_joint(
                         target_kd=target_kd,
                         damping=joint_linear_damping,
                         stiffness=joint_stiffness,
-                        armature=joint_armature,
+                        armature=R.get_value(
+                            joint_prim, PrimType.JOINT, f"{trans_name}_armature", default=joint_armature
+                        ),
                         effort_limit=effort_limit,
                         velocity_limit=joint_velocity_limit
                         if joint_velocity_limit is not None
@@ -469,7 +471,9 @@ def parse_joint(
                         target_kd=target_kd / DegreesToRadian / joint_drive_gains_scaling,
                         damping=joint_angular_damping,
                         stiffness=joint_stiffness,
-                        armature=joint_armature,
+                        armature=R.get_value(
+                            joint_prim, PrimType.JOINT, f"{rot_name}_armature", default=joint_armature
+                        ),
                         effort_limit=effort_limit,
                         velocity_limit=joint_velocity_limit * DegreesToRadian
                         if joint_velocity_limit is not None
