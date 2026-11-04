@@ -3,16 +3,17 @@
 
 """Test authored MuJoCo collision masks imported from USD."""
 
+import itertools
 import unittest
 
 import numpy as np
 
 import newton
-from newton.solvers import SolverMuJoCo
+from newton.solvers import SolverMuJoCo, mujoco
 from newton.tests.unittest_utils import USD_AVAILABLE
 
 if USD_AVAILABLE:
-    from pxr import Sdf, Usd, UsdGeom, UsdPhysics
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
 
 @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
@@ -114,6 +115,135 @@ class TestUsdCollisionMasks(unittest.TestCase):
         for a in range(model.shape_count):
             for b in range(a + 1, model.shape_count):
                 self.assertEqual(self._masks_allow(solver, a, b), (a, b) in expected)
+
+    def test_large_authored_masks_preserve_filtered_static_hardware(self):
+        """Preserve all native pairs above 256 shapes and 32 independent fruit bodies."""
+        import mujoco
+
+        for apple_apple, apple_wood in itertools.product((False, True), repeat=2):
+            with self.subTest(apple_apple=apple_apple, apple_wood=apple_wood):
+                wood = (1, 2)
+                apple = (4, 2 | (4 if apple_apple else 0) | (1 if apple_wood else 0))
+                hardware = (2, 1)
+                body_masks = [[wood] * 112, [wood] * 113] + [[apple] for _ in range(34)]
+                body_masks += [[hardware], [hardware]]
+                stage = self._stage(body_masks)
+                # Compile separated bodies so constructor forward dynamics does
+                # not solve thousands of deliberately overlapping contacts.
+                for body_index in range(36):
+                    UsdGeom.Xformable(stage.GetPrimAtPath(f"/body{body_index}")).AddTranslateOp().Set(
+                        Gf.Vec3d(float(body_index), 0.0, 0.0)
+                    )
+                for index in (36, 37):
+                    stage.GetPrimAtPath(f"/body{index}").RemoveAPI(UsdPhysics.RigidBodyAPI)
+                UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0")).CreateFilteredPairsRel().AddTarget(
+                    Sdf.Path("/body36/shape0")
+                )
+                builder = self._builder()
+                result = builder.add_usd(stage, load_visual_shapes=False)
+                model = builder.finalize(device="cpu")
+                self.assertGreater(model.shape_count, 256)
+                solver = self._solver(model)
+                shape_to_geom = {
+                    int(shape): geom for geom, shape in enumerate(solver.mjc_geom_to_newton_shape.numpy()[0])
+                }
+                shapes = result["path_shape_map"]
+                for body_index, masks in enumerate(body_masks):
+                    for shape_index, mask in enumerate(masks):
+                        geom = shape_to_geom[shapes[f"/body{body_index}/shape{shape_index}"]]
+                        self.assertEqual(int(solver.mj_model.geom_contype[geom]), mask[0])
+                        self.assertEqual(int(solver.mj_model.geom_conaffinity[geom]), mask[1])
+                wire = shapes["/body36/shape0"]
+                self.assertEqual(int(model.shape_body.numpy()[wire]), -1)
+                self.assertGreater(int(solver.mj_model.geom_bodyid[shape_to_geom[wire]]), 0)
+
+                # Then overlap every sphere for collision detection only: verify
+                # all allowed/forbidden pairs without an unrelated dense solve.
+                # Static hardware remains at its compiled origin/BVH throughout.
+                data = mujoco.MjData(solver.mj_model)
+                for joint, kind in enumerate(solver.mj_model.jnt_type):
+                    self.assertEqual(int(kind), int(mujoco.mjtJoint.mjJNT_FREE))
+                    address = int(solver.mj_model.jnt_qposadr[joint])
+                    data.qpos[address : address + 3] = 0.0
+                mujoco.mj_kinematics(solver.mj_model, data)
+                mujoco.mj_collision(solver.mj_model, data)
+                mapping = solver.mjc_geom_to_newton_shape.numpy()[0]
+                actual = {
+                    tuple(sorted((int(mapping[contact.geom1]), int(mapping[contact.geom2]))))
+                    for contact in data.contact[: data.ncon]
+                }
+                expected = set(map(tuple, model.shape_contact_pairs.numpy()))
+                self.assertEqual(actual, expected)
+
+    def test_partial_static_filter_above_compiler_cap_uses_exact_coloring(self):
+        """Preserve a representable partial-owner filter without excluding its other shapes."""
+        import mujoco
+
+        stage = self._stage([[(1, 0)] * 257, [(0, 1)]])
+        stage.GetPrimAtPath("/body1").RemoveAPI(UsdPhysics.RigidBodyAPI)
+        # Compile separated, then request the all-overlap contact set explicitly;
+        # constructor scratch data is not a collision-query result.
+        UsdGeom.Xformable(stage.GetPrimAtPath("/body0")).AddTranslateOp().Set(Gf.Vec3d(1.0, 0.0, 0.0))
+        UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0/shape0")).CreateFilteredPairsRel().AddTarget(
+            Sdf.Path("/body1/shape0")
+        )
+        builder = self._builder()
+        result = builder.add_usd(stage, load_visual_shapes=False)
+        model = builder.finalize(device="cpu")
+        solver = self._solver(model)
+        shapes = result["path_shape_map"]
+        wire = shapes["/body1/shape0"]
+        self.assertFalse(self._masks_allow(solver, shapes["/body0/shape0"], wire))
+        for index in range(1, 257):
+            self.assertTrue(self._masks_allow(solver, shapes[f"/body0/shape{index}"], wire))
+        data = mujoco.MjData(solver.mj_model)
+        self.assertEqual(solver.mj_model.njnt, 1)
+        self.assertEqual(int(solver.mj_model.jnt_type[0]), int(mujoco.mjtJoint.mjJNT_FREE))
+        address = int(solver.mj_model.jnt_qposadr[0])
+        data.qpos[address : address + 3] = 0.0
+        mujoco.mj_kinematics(solver.mj_model, data)
+        mujoco.mj_collision(solver.mj_model, data)
+        mapping = solver.mjc_geom_to_newton_shape.numpy()[0]
+        actual = {
+            tuple(sorted((int(mapping[contact.geom1]), int(mapping[contact.geom2]))))
+            for contact in data.contact[: data.ncon]
+        }
+        self.assertEqual(actual, set(map(tuple, model.shape_contact_pairs.numpy())))
+
+    def test_connect_anchors_with_filtered_static_wire(self):
+        """Keep CONNECT world anchors unchanged when a filtered static wire gains a native body."""
+        stage = self._stage([[(1, 0)], [(0, 1)], [(1, 0)]])
+        stage.GetPrimAtPath("/body1").RemoveAPI(UsdPhysics.RigidBodyAPI)
+        UsdGeom.Xformable(stage.GetPrimAtPath("/body0")).AddTranslateOp().Set(Gf.Vec3d(0.0, 2.0, 3.0))
+        UsdGeom.Xformable(stage.GetPrimAtPath("/body1")).AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+        UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0")).CreateFilteredPairsRel().AddTarget(
+            Sdf.Path("/body1/shape0")
+        )
+        builder = self._builder()
+        result = builder.add_usd(stage, load_visual_shapes=False)
+        dynamic_body = result["path_body_map"]["/body0"]
+        local_anchor = np.array([1.0, 0.0, 0.0])
+        world_anchor = np.asarray(builder.body_q[dynamic_body].p) + local_anchor
+        np.testing.assert_allclose(world_anchor, [1.0, 2.0, 3.0], atol=1.0e-6)
+        # Author the equivalent native CONNECT directly: static-Xform endpoint
+        # resolution belongs to a separate importer change.
+        mujoco.add_equality_connect(builder, dynamic_body, -1, anchor=local_anchor, label="wire_connect")
+        model = builder.finalize(device="cpu")
+        solver = self._solver(model)
+        # Switchable roots also reserve an inactive native WELD. Select the
+        # authored CONNECT by type rather than assuming it is the only equality.
+        connect_rows = np.flatnonzero(solver.mj_model.eq_type == solver._mujoco.mjtEq.mjEQ_CONNECT)
+        self.assertEqual(len(connect_rows), 1)
+        connect_row = int(connect_rows[0])
+        np.testing.assert_allclose(solver.mj_model.eq_data[connect_row, :3], local_anchor, atol=1.0e-6)
+        np.testing.assert_allclose(solver.mj_model.eq_data[connect_row, 3:6], world_anchor, atol=1.0e-6)
+        self.assertEqual(int(solver.mj_model.eq_obj2id[connect_row]), 0)
+        wire = result["path_shape_map"]["/body1/shape0"]
+        self.assertEqual(int(model.shape_body.numpy()[wire]), -1)
+        shape_to_geom = {int(shape): geom for geom, shape in enumerate(solver.mjc_geom_to_newton_shape.numpy()[0])}
+        wire_body = int(solver.mj_model.geom_bodyid[shape_to_geom[wire]])
+        self.assertGreater(wire_body, 0)
+        self.assertEqual(int(solver.mj_model.body_weldid[wire_body]), 0)
 
     def test_unauthored_masks_have_no_domain(self):
         """Leave unauthored shapes outside preserved collision mask domains."""

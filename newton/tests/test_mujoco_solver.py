@@ -77,8 +77,8 @@ def _expected_positive_limit_solref(ke: float, kd: float, factor: float) -> np.n
 
 
 class TestMuJoCoSolver(unittest.TestCase):
-    def test_collision_coloring_uses_all_32_mujoco_mask_bits(self):
-        """Verify that graph-color fallback uses bits 0 through 31 before degrading to MuJoCo defaults."""
+    def test_collision_mask_compiler_limits_fail_closed(self):
+        """Reject inexact native masks instead of degrading to collide-all colors."""
         clique_size = 33
         isolated_shape_count = 24
         shape_count = clique_size + isolated_shape_count
@@ -89,31 +89,17 @@ class TestMuJoCoSolver(unittest.TestCase):
             joint = builder.add_joint_free(body)
             builder.add_articulation([joint])
 
-        # The 33-shape clique requires 33 colors. Isolating another 24 shapes
-        # creates more than 1,024 sparse exclusions, which also forces the
-        # legacy fallback when the bounded mask compiler from #3714 is used.
+        # More than 1,024 sparse exclusions force the bounded compiler to skip.
+        # Native conversion must reject this case rather than enable forbidden
+        # contacts when the allowed clique needs more than 32 colors.
         colliding_pairs = set(itertools.combinations(range(clique_size), 2))
         for pair in itertools.combinations(range(shape_count), 2):
             if pair not in colliding_pairs:
                 builder.add_shape_collision_filter_pair(*pair)
 
         model = builder.finalize(device="cpu")
-        colors = SolverMuJoCo._color_collision_shapes(model, np.arange(model.shape_count))
-        np.testing.assert_array_equal(np.sort(np.unique(colors)), np.arange(33))
-
-        solver = SolverMuJoCo(model, use_mujoco_cpu=True)
-        expected_masks = {SolverMuJoCo._collision_color_masks(color) for color in range(33)}
-        actual_masks = {
-            (int(contype), int(conaffinity))
-            for contype, conaffinity in zip(
-                solver.mj_model.geom_contype,
-                solver.mj_model.geom_conaffinity,
-                strict=True,
-            )
-        }
-        self.assertEqual(actual_masks, expected_masks)
-        self.assertIn((-2147483648, 2147483647), actual_masks)
-        self.assertIn((1, 1), actual_masks)
+        with self.assertRaisesRegex(ValueError, "Cannot represent Newton collision filters exactly"):
+            SolverMuJoCo(model, use_mujoco_cpu=True)
 
     def test_tolerance_options(self):
         """Test that tolerance and ls_tolerance options are properly set on the MuJoCo Warp model."""
@@ -3283,8 +3269,8 @@ class TestMuJoCoSolverCollisionMasks(unittest.TestCase):
                 )
                 self.assertEqual(actual, expected, f"MuJoCo pair {(shape_a, shape_b)}")
 
-    def test_falls_back_when_exact_masks_exceed_32_bits(self):
-        """Fall back for a graph that provably needs 33 mask bits."""
+    def test_rejects_native_graphs_exceeding_32_bits(self):
+        """Reject unrepresentable native masks while retaining Newton-generated contacts."""
         builder = newton.ModelBuilder()
         for index, group in enumerate(np.repeat(np.arange(1, 34), 2)):
             body = builder.add_link(label=f"body_{index}")
@@ -3293,10 +3279,54 @@ class TestMuJoCoSolverCollisionMasks(unittest.TestCase):
             cfg = newton.ModelBuilder.ShapeConfig(collision_group=int(group))
             builder.add_shape_sphere(body, radius=0.1, cfg=cfg, label=f"shape_{index}")
 
-        with warnings.catch_warnings():
-            warnings.filterwarnings("error", message=r"The selected Newton collision graph.*")
-            solver = SolverMuJoCo(builder.finalize(device="cpu"), use_mujoco_contacts=True)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "Cannot represent Newton collision filters exactly"):
+            SolverMuJoCo(model, use_mujoco_contacts=True, use_mujoco_cpu=True)
+        solver = SolverMuJoCo(model, use_mujoco_contacts=False, use_mujoco_cpu=True)
         self.assertEqual(solver.mj_model.ngeom, 66)
+        self.assertTrue(np.all(solver.mj_model.geom_contype == 0))
+        self.assertTrue(np.all(solver.mj_model.geom_conaffinity == 0))
+
+    def test_exact_coloring_survives_bounded_mask_compiler_limits(self):
+        """Keep exact native coloring at 32 colors and above the compiler's shape cap."""
+        import mujoco
+
+        for shape_count, clique_size in ((61, 32), (257, 3)):
+            with self.subTest(shape_count=shape_count, clique_size=clique_size):
+                builder = newton.ModelBuilder()
+                for index in range(shape_count):
+                    body = builder.add_link(
+                        xform=wp.transform(wp.vec3(float(index), 0.0, 0.0), wp.quat_identity()),
+                        label=f"body_{index}",
+                    )
+                    joint = builder.add_joint_free(body)
+                    builder.add_articulation([joint])
+                    builder.add_shape_sphere(body, radius=0.1, label=f"shape_{index}")
+                expected = set(itertools.combinations(range(clique_size), 2))
+                for pair in itertools.combinations(range(shape_count), 2):
+                    if pair not in expected:
+                        builder.add_shape_collision_filter_pair(*pair)
+                model = builder.finalize(device="cpu")
+                compiled = SolverMuJoCo._compile_newton_collision_masks(model, np.arange(shape_count))
+                self.assertFalse(compiled.exact)
+                solver = SolverMuJoCo(model, use_mujoco_contacts=True, use_mujoco_cpu=True)
+                self.assertEqual(len(np.unique(solver.mj_model.geom_contype)), clique_size)
+                if clique_size == 32:
+                    self.assertIn(-2147483648, solver.mj_model.geom_contype)
+                # Constructor poses are separated. Exercise the complete graph
+                # with collision detection only, without solving overlap forces.
+                data = mujoco.MjData(solver.mj_model)
+                for joint in range(solver.mj_model.njnt):
+                    address = int(solver.mj_model.jnt_qposadr[joint])
+                    data.qpos[address : address + 3] = 0.0
+                mujoco.mj_kinematics(solver.mj_model, data)
+                mujoco.mj_collision(solver.mj_model, data)
+                mapping = solver.mjc_geom_to_newton_shape.numpy()[0]
+                actual = {
+                    tuple(sorted((int(mapping[contact.geom1]), int(mapping[contact.geom2]))))
+                    for contact in data.contact[: data.ncon]
+                }
+                self.assertEqual(actual, expected)
 
 
 class TestMuJoCoSolverGeomProperties(unittest.TestCase):
