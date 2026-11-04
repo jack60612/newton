@@ -5443,9 +5443,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         return [(selected_bodies[bodies_a[k]], selected_bodies[bodies_b[k]]) for k in np.flatnonzero(excluded)]
 
     @staticmethod
-    def _find_static_collision_filter_pairs(
-        model: Model, selected_shapes: np.ndarray
-    ) -> list[tuple[int, int]]:
+    def _find_static_collision_filter_pairs(model: Model, selected_shapes: np.ndarray) -> list[tuple[int, int]]:
         """Find world-owned shape/whole-body filters representable as native excludes."""
         shape_body = model.shape_body.numpy()
         if not np.any(shape_body[selected_shapes] < 0):
