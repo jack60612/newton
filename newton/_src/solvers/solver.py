@@ -600,6 +600,9 @@ class SolverBase:
           have changed.
         * ``ModelFlags.JOINT_DOF_PROPERTIES``: Joint axis limits, targets,
           modes, DOF state, or force buffers have changed.
+        * ``ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES``: Only joint effort
+          limits have changed. Unlike a broad DOF update, this does not require
+          recomputing inertia or reference-pose constants.
         * ``ModelFlags.BODY_PROPERTIES``: Rigid-body pose or velocity buffers
           have changed.
         * ``ModelFlags.BODY_INERTIAL_PROPERTIES``: Rigid-body mass or inertia

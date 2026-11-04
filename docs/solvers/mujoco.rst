@@ -956,6 +956,15 @@ for a fixed-root articulation after constructing the solver, call
 :attr:`~newton.ModelFlags.JOINT_PROPERTIES` flag to
 synchronize the updated fixed-root poses into MuJoCo.
 
+For edits to only :attr:`~newton.Model.joint_effort_limit`, notify with
+:attr:`~newton.ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES`. This refreshes each
+world's joint actuator-force range (and the CPU template's world-zero range)
+without rebuilding mass, reference-pose, or actuator-length constants. Sleeping
+worlds are still awakened. The broad :attr:`~newton.ModelFlags.JOINT_DOF_PROPERTIES`
+flag remains valid and is required when changing other DOF properties alongside
+the effort limit. Position and velocity commands belong in :class:`~newton.Control`,
+not model-property writers, and require no model notification.
+
 
 .. _mujoco-code-pointers:
 

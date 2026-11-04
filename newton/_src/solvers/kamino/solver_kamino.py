@@ -1102,8 +1102,9 @@ class SolverKamino(SolverBase, CouplingInterface):
         self._validate_structural_invariants(flags)
         self._solver_kamino.validate_model_changed(flags)
 
-        if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES):
-            # The documentation is unclear about which flag should trigger this update, so we update on both flags.
+        if flags & (
+            ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES
+        ):
             self._update_actuation_types()
 
         if flags & ModelFlags.MODEL_PROPERTIES:
@@ -1150,6 +1151,7 @@ class SolverKamino(SolverBase, CouplingInterface):
             | ModelFlags.SHAPE_PROPERTIES
             | ModelFlags.JOINT_PROPERTIES
             | ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES
             | ModelFlags.ACTUATOR_PROPERTIES
             | ModelFlags.CONSTRAINT_PROPERTIES
             | ModelFlags.TENDON_PROPERTIES
@@ -1436,9 +1438,16 @@ class SolverKamino(SolverBase, CouplingInterface):
         Raises:
             RuntimeError: If the solver must be recreated to apply the edit.
         """
-        check_dof = bool(flags & ModelFlags.JOINT_DOF_PROPERTIES)
-        check_actuation = bool(flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES))
-        check_axes = check_dof
+        check_dof = bool(flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES))
+        check_actuation = bool(
+            flags
+            & (
+                ModelFlags.JOINT_DOF_PROPERTIES
+                | ModelFlags.ACTUATOR_PROPERTIES
+                | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES
+            )
+        )
+        check_axes = bool(flags & ModelFlags.JOINT_DOF_PROPERTIES)
         check_body_immovability = bool(flags & (ModelFlags.BODY_PROPERTIES | ModelFlags.BODY_INERTIAL_PROPERTIES))
         if not (check_dof or check_actuation or check_axes or check_body_immovability):
             return

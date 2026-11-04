@@ -182,6 +182,7 @@ class TestKaminoNotifyModelChanged(unittest.TestCase):
             newton.ModelFlags.BODY_INERTIAL_PROPERTIES,
             newton.ModelFlags.SHAPE_PROPERTIES,
             newton.ModelFlags.JOINT_DOF_PROPERTIES,
+            newton.ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES,
             newton.ModelFlags.ACTUATOR_PROPERTIES,
             newton.ModelFlags.CONSTRAINT_PROPERTIES,
             newton.ModelFlags.TENDON_PROPERTIES,
@@ -641,30 +642,34 @@ class TestKaminoNotifyModelChanged(unittest.TestCase):
 
     def test_effort_limit_value_edit_is_allowed(self):
         """Allow finite effort-limit edits that preserve implicit-PD row topology."""
-        model = _build_revolute(
-            actuator_mode=newton.JointTargetMode.POSITION,
-            effort_limit=1.0,
-            target_ke=100.0,
-        )
-        solver = SolverKamino(model)
-        model.joint_effort_limit.assign([0.25])
-
-        solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
-
-    def test_effort_limit_finiteness_change_raises(self):
-        """Reject effort-limit edits that change implicit-PD row topology."""
-        for initial_limit, updated_limit in ((1.0, math.inf), (math.inf, 1.0)):
-            with self.subTest(initial_limit=initial_limit, updated_limit=updated_limit):
+        for flag in (newton.ModelFlags.JOINT_DOF_PROPERTIES, newton.ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES):
+            with self.subTest(flag=flag.name):
                 model = _build_revolute(
                     actuator_mode=newton.JointTargetMode.POSITION,
-                    effort_limit=initial_limit,
+                    effort_limit=1.0,
                     target_ke=100.0,
                 )
                 solver = SolverKamino(model)
-                model.joint_effort_limit.assign([updated_limit])
+                for limit in (0.25, 0.5, 0.125):
+                    model.joint_effort_limit.assign([limit])
+                    solver.notify_model_changed(flag)
+                    self.assertEqual(float(solver._model_kamino.joints.tau_j_max.numpy()[0]), limit)
 
-                with self.assertRaisesRegex(RuntimeError, "joint dynamics allocation"):
-                    solver.notify_model_changed(newton.ModelFlags.JOINT_DOF_PROPERTIES)
+    def test_effort_limit_finiteness_change_raises(self):
+        """Reject effort-limit edits that change implicit-PD row topology."""
+        for flag in (newton.ModelFlags.JOINT_DOF_PROPERTIES, newton.ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES):
+            for initial_limit, updated_limit in ((1.0, math.inf), (math.inf, 1.0)):
+                with self.subTest(flag=flag.name, initial_limit=initial_limit, updated_limit=updated_limit):
+                    model = _build_revolute(
+                        actuator_mode=newton.JointTargetMode.POSITION,
+                        effort_limit=initial_limit,
+                        target_ke=100.0,
+                    )
+                    solver = SolverKamino(model)
+                    model.joint_effort_limit.assign([updated_limit])
+
+                    with self.assertRaisesRegex(RuntimeError, "joint dynamics allocation"):
+                        solver.notify_model_changed(flag)
 
     def test_zero_gains_remove_effort_row_raises(self):
         """Reject gain edits that remove an implicit-PD effort row."""
