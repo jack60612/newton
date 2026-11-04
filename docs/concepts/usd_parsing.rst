@@ -43,6 +43,14 @@ Revolute ``mjc:ref`` and ``mjc:springref`` instead follow the PhysicsScene's
 ``mjc:compiler:angle`` setting (degrees by default). The importer converts these
 values to radians or radians/s.
 
+MuJoCo equality site precision
+------------------------------
+
+Site targets within rigid bodies are resolved in double precision before their
+local anchor is stored as a native float32 vector. This avoids subtracting
+already-rounded world positions and preserves small authored offsets under
+translated, rotated, or scaled ancestors.
+
 Particle Simulation Geometry
 ----------------------------
 
