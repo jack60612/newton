@@ -381,7 +381,14 @@ class LOXSolver:
     def validate_model_changed(self, flags: ModelFlags | int) -> None:
         """Validate the joint friction and effort limits when the joint DOF values change, and that no body
         became massless or gained mass when the inertial properties change."""
-        check_joints = bool(flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES))
+        check_joints = bool(
+            flags
+            & (
+                ModelFlags.JOINT_DOF_PROPERTIES
+                | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+                | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES
+            )
+        )
         check_masses = bool(flags & ModelFlags.BODY_INERTIAL_PROPERTIES) and self._massless_bodies is not None
         if not (check_joints or check_masses):
             return

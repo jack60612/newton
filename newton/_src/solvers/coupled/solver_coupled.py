@@ -3894,6 +3894,8 @@ class SolverCoupled(SolverBase, CouplingInterface):
             return True
         if flags & int(ModelFlags.JOINT_DOF_INERTIAL_PROPERTIES) and attribute.name == "joint_armature":
             return True
+        if flags & int(ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES) and attribute.name == "joint_effort_limit":
+            return True
         if flags & int(ModelFlags.SHAPE_PROPERTIES):
             if frequency == model_frequency.SHAPE or "pair_" in attribute.name:
                 return True

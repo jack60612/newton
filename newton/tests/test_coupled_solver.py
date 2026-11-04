@@ -2275,6 +2275,13 @@ class TestSolverCoupledBasic(unittest.TestCase):
         np.testing.assert_array_equal(view.joint_target_q.numpy(), [17.0, 18.0])
         np.testing.assert_array_equal(view.joint_target_ke.numpy(), [106.0, 107.0])
 
+        model.joint_effort_limit.assign(200.0 + np.arange(model.joint_dof_count, dtype=np.float32))
+        # A narrow notification must project just the force bounds, not unrelated gains.
+        model.joint_target_ke.assign(300.0 + np.arange(model.joint_dof_count, dtype=np.float32))
+        coupled.notify_model_changed(newton.ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES)
+        np.testing.assert_array_equal(view.joint_effort_limit.numpy(), [206.0, 207.0])
+        np.testing.assert_array_equal(view.joint_target_ke.numpy(), [106.0, 107.0])
+
         model.joint_armature.fill_(3.0)
         model.mujoco.dof_ref.fill_(0.2)
         rest_q = model.joint_rest_q.numpy()

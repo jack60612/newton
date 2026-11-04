@@ -2335,6 +2335,20 @@ def update_jnt_properties_kernel(
 
 
 @wp.kernel
+def update_jnt_effort_limits_kernel(
+    mjc_jnt_to_newton_dof: wp.array2d[wp.int32],
+    joint_effort_limit: wp.array[float],
+    jnt_actfrcrange: wp.array2d[wp.vec2],
+):
+    """Refresh force bounds without touching joint ranges or derived constants."""
+    world, mjc_jnt = wp.tid()
+    newton_dof = mjc_jnt_to_newton_dof[world, mjc_jnt]
+    if newton_dof >= 0:
+        limit = joint_effort_limit[newton_dof]
+        jnt_actfrcrange[world, mjc_jnt] = wp.vec2(-limit, limit)
+
+
+@wp.kernel
 def update_jnt_reference_kernel(
     mjc_jnt_to_newton_dof: wp.array2d[int],
     jnt_type: wp.array[int],
