@@ -282,6 +282,7 @@ def parse_usd(
         load_static_visual_shapes: If True, supported visual-only geometry outside
             rigid-body hierarchies is loaded as static shapes when
             ``load_visual_shapes`` is also True. Default is True.
+            Static sites are controlled independently by ``load_sites``.
         hide_collision_shapes: If True, collision shapes on bodies that already
             have visual-only geometry are hidden unconditionally, regardless of
             whether the collider has authored PBR material data. Default is False.
@@ -294,6 +295,11 @@ def parse_usd(
             joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. If False,
             equality constraints are preserved in the ``mujoco:equality_constraint`` custom-attribute namespace
             and finalize under ``model.mujoco.equality_constraint_*``.
+            CONNECT/WELD constraints with world, standalone zero-mass, or standalone world-fixed endpoints
+            remain native equalities even when True; they do not create Newton loop joints.
+            Bodies owned by an articulation are not treated as standalone static endpoints.
+            Static Xformable/site targets without rigid-body ancestors resolve to world using
+            their composed affine frame and the incoming import transform.
         mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
         schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
             Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.
@@ -548,7 +554,7 @@ def parse_usd(
     _deformable_prims = _scout_deformable_prims(
         root_prim,
         ignore_paths,
-        collect_static_visuals=load_visual_shapes and load_static_visual_shapes,
+        collect_static_visuals=load_sites or (load_visual_shapes and load_static_visual_shapes),
     )
     deformable_visual_exclude_paths = set(_deformable_prims.native_physics_exclude_paths)
     native_exclude_paths = list(
@@ -715,14 +721,20 @@ def parse_usd(
         return bool(
             default_prim
             and default_prim.IsValid()
+            and default_prim.IsA(UsdGeom.Xformable)
             and target_path == str(default_prim.GetPath())
             and target_path not in path_body_map
+            and not default_prim.HasAPI(UsdPhysics.RigidBodyAPI)
         )
 
-    def _get_target_body_and_local_pos(target_path: str) -> tuple[int, wp.vec3] | None:
+    def _get_target_body_and_local_pos(target_path: str, world_local_pos: wp.vec3) -> tuple[int, wp.vec3] | None:
         """Resolve a target to its body index and body-local position."""
         if _is_world_target(target_path):
-            return (-1, wp.vec3())
+            if target_path in ("", "/"):
+                return (-1, wp.transform_point(incoming_world_xform, world_local_pos))
+            target_prim = stage.GetPrimAtPath(target_path)
+            target_mat = _get_prim_world_mat(target_prim, None, incoming_world_xform)
+            return (-1, wp.transform_point(target_mat, world_local_pos))
 
         target_prim = stage.GetPrimAtPath(target_path)
         if not target_prim or not target_prim.IsValid():
@@ -730,7 +742,19 @@ def parse_usd(
 
         body_path = _get_rigid_body_ancestor_path(target_prim)
         if body_path is None:
-            return None
+            if not target_prim.IsA(UsdGeom.Xformable):
+                return None
+            # Do not turn filtered/disabled rigid bodies or invalid joint targets
+            # into world anchors. Only genuinely static xforms/sites qualify.
+            current = target_prim
+            while current and current.IsValid():
+                if current.HasAPI(UsdPhysics.RigidBodyAPI) or any(
+                    re.match(pattern, str(current.GetPath())) for pattern in ignore_paths
+                ):
+                    return None
+                current = current.GetParent()
+            target_mat = _get_prim_world_mat(target_prim, None, incoming_world_xform)
+            return (-1, wp.transform_point(target_mat, world_local_pos))
 
         body_idx = path_body_map.get(body_path, -1)
         if body_idx < 0:
@@ -773,9 +797,12 @@ def parse_usd(
             )
             return None, None
 
-        # Empty target means world body (index -1).
-        body0_info = _get_target_body_and_local_pos(target0) if target0 else (-1, wp.vec3())
-        body1_info = _get_target_body_and_local_pos(target1) if target1 else (-1, wp.vec3())
+        # Static/site targets retain their full authored affine frame.
+        joint = UsdPhysics.Joint(joint_prim)
+        local_pos0 = wp.vec3(*joint.GetLocalPos0Attr().Get())
+        local_pos1 = wp.vec3(*joint.GetLocalPos1Attr().Get())
+        body0_info = _get_target_body_and_local_pos(target0, local_pos0)
+        body1_info = _get_target_body_and_local_pos(target1, local_pos1)
 
         if body0_info is None or body1_info is None:
             failed_targets = []
@@ -1911,7 +1938,7 @@ def parse_usd(
     # The import scout collected supported visual leaf candidates during its existing
     # instance-proxy walk. Body visuals were already loaded by add_body(), so only untouched
     # static candidates need geometry/material work here.
-    if load_visual_shapes and load_static_visual_shapes:
+    if load_sites or (load_visual_shapes and load_static_visual_shapes):
         rigid_body_paths = {str(path) for path in ret_dict.get(UsdPhysics.ObjectType.RigidBody, ((), ()))[0]}
 
         def _is_in_rigid_body_hierarchy(path: str) -> bool:
@@ -1925,7 +1952,9 @@ def parse_usd(
             path = str(prim.GetPath())
             if path in deformable_visual_exclude_paths or path in path_shape_map or _is_in_rigid_body_hierarchy(path):
                 continue
-            _load_visual_shapes_impl(-1, prim, recurse=False)
+            _load_visual_shapes_impl(
+                -1, prim, allow_visual_shapes=load_visual_shapes and load_static_visual_shapes, recurse=False
+            )
 
     # OpenUSD groups are allow-by-default filters and cannot be represented by Newton's
     # equality-based collision group IDs, so their disabled pairs are lowered explicitly after
@@ -2510,6 +2539,27 @@ def parse_usd(
     # builder's collapse logic can remap body/joint indices and adjust anchors/relposes
     # for any bodies that get merged.
     def _parse_mjc_equality_constraints():
+        articulated_bodies = {
+            body
+            for joint, articulation in enumerate(builder.joint_articulation)
+            if articulation >= 0
+            for body in (builder.joint_parent[joint], builder.joint_child[joint])
+        }
+        static_equality_bodies = {
+            body for body, mass in enumerate(builder.body_mass) if mass <= 0.0 and body not in articulated_bodies
+        }
+        # Collider-derived mass does not make a world-fixed body dynamic.
+        # USD exporters can omit mass/density on otherwise static hardware.
+        static_equality_bodies.update(
+            child
+            for joint, child in enumerate(builder.joint_child)
+            if builder.joint_parent[joint] == -1
+            and builder.joint_type[joint] == JointType.FIXED
+            and builder.joint_articulation[joint] == -1
+            and child not in articulated_bodies
+        )
+        static_equality_bodies.add(-1)
+
         def add_converted_loop_joint(
             eq_type: EqType,
             body1: int,
@@ -2543,6 +2593,24 @@ def parse_usd(
                 return
 
             path_joint_map[joint_path] = joint_idx
+
+        def world_joint_pose(joint_prim: Usd.Prim, target_path: str, side: int) -> wp.transform:
+            local_pos = wp.vec3(*joint_prim.GetAttribute(f"physics:localPos{side}").Get())
+            local_rot = usd.value_to_warp(joint_prim.GetAttribute(f"physics:localRot{side}").Get())
+            local_pose = wp.transform(local_pos, local_rot)
+            if target_path in ("", "/"):
+                target_mat = _xform_to_mat44(incoming_world_xform)
+            else:
+                target_mat = _get_prim_world_mat(stage.GetPrimAtPath(target_path), None, incoming_world_xform)
+            # Non-uniform scale followed by a rotated local joint can introduce
+            # shear. Strip it from the full frame using USD's rigid-pose rule,
+            # but retain the full affine translation (including local offsets).
+            composed = Gf.Matrix4d(
+                np.array(target_mat @ _xform_to_mat44(local_pose), dtype=float).reshape(4, 4).T.tolist()
+            )
+            position = wp.vec3(*composed.ExtractTranslation())
+            rotation = usd.value_to_warp(composed.RemoveScaleShear().ExtractRotationQuat())
+            return wp.transform(position, rotation)
 
         for joint_path, joint_desc in joint_descriptions.items():
             joint_prim = stage.GetPrimAtPath(joint_path)
@@ -2580,15 +2648,15 @@ def parse_usd(
                 target1 = _get_first_target(joint_prim, "physics:body1")
 
                 if is_connect:
-                    # Use the authored localPose0 when target0 is a known body or the world
-                    # (empty target means world); fall back to the site-derived local position
-                    # only when target0 is a site prim that is not itself a body.
-                    anchor = (
-                        wp.vec3(*joint_desc.localPose0Position)
-                        if (_is_world_target(target0) or target0 in path_body_map)
-                        else site0_local_pos
+                    # Rigid-body local poses remain authoritative; static/world
+                    # endpoints already include their authored/import transforms.
+                    anchor = wp.vec3(*joint_desc.localPose0Position) if target0 in path_body_map else site0_local_pos
+                    # Standalone static/world endpoints have no articulation loop
+                    # target. Preserve their authoritative native equality instead.
+                    convert_connect = convert_mjc_equality_constraints and not (
+                        body0_idx in static_equality_bodies or body1_idx in static_equality_bodies
                     )
-                    if convert_mjc_equality_constraints:
+                    if convert_connect:
                         add_converted_loop_joint(
                             EqType.CONNECT,
                             body0_idx,
@@ -2616,13 +2684,15 @@ def parse_usd(
                     local_rot1 = usd.value_to_warp(joint_desc.localPose1Orientation)
                     local_pos0 = wp.vec3(*joint_desc.localPose0Position)
                     local_pos1 = wp.vec3(*joint_desc.localPose1Position)
-                    # MuJoCo weld anchors are authored on the body1 side. Direct
-                    # body/world targets use localPose1; site targets use the site position.
-                    anchor = (
-                        wp.vec3(*joint_desc.localPose1Position)
-                        if (_is_world_target(target1) or target1 in path_body_map)
-                        else site1_local_pos
-                    )
+                    if body0_idx < 0:
+                        world_pose0 = world_joint_pose(joint_prim, target0, 0)
+                        local_pos0, local_rot0 = world_pose0.p, world_pose0.q
+                    if body1_idx < 0:
+                        world_pose1 = world_joint_pose(joint_prim, target1, 1)
+                        local_pos1, local_rot1 = world_pose1.p, world_pose1.q
+                    # Native WELD anchors live in the second endpoint's frame.
+                    # Static endpoints use their complete transformed joint pose.
+                    anchor = local_pos1 if body1_idx < 0 or target1 in path_body_map else site1_local_pos
                     relpose_rot = local_rot0 * wp.quat_inverse(local_rot1)
                     relpose_pos = local_pos0 - wp.quat_rotate(relpose_rot, local_pos1)
                     torquescale_attr = joint_prim.GetAttribute("mjc:torqueScale")
@@ -2630,7 +2700,10 @@ def parse_usd(
                         float(torquescale_attr.Get()) if torquescale_attr and torquescale_attr.HasValue() else 1.0
                     )
                     relpose = wp.transform(relpose_pos, relpose_rot)
-                    if convert_mjc_equality_constraints:
+                    convert_weld = convert_mjc_equality_constraints and not (
+                        body0_idx in static_equality_bodies or body1_idx in static_equality_bodies
+                    )
+                    if convert_weld:
                         add_converted_loop_joint(
                             EqType.WELD,
                             body0_idx,

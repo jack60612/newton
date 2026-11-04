@@ -7730,7 +7730,11 @@ class TestMuJoCoAttributes(unittest.TestCase):
         newton.solvers.SolverMuJoCo.register_custom_attributes(builder)
         builder.add_usd(stage)
         model = builder.finalize()
-        with self.assertWarnsRegex(UserWarning, "standalone world roots"):
+        # The world-facing joint of the articulation root is imported into the articulation,
+        # so SolverMuJoCo needs no standalone world-root fallback.
+        self.assertEqual(model.joint_articulation.numpy().tolist(), [0])
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error", message=".*standalone world roots")
             solver = SolverMuJoCo(model, separate_worlds=False)
         assert hasattr(model, "mujoco")
         assert hasattr(model.mujoco, "condim")

@@ -75,15 +75,43 @@ For example, a floating rigid body with angular rotors only can author:
    custom float newton:rotY:armature = 0.002
    custom float newton:rotZ:armature = 0.004
 
-MuJoCo CONNECT anchors
-----------------------
+MuJoCo body equality frames
+---------------------------
 
 ``MjcEqualityConnectAPI`` constraints preserve body-local anchors, including
 endpoints on standalone static bodies with translated or rotated USD frames.
 SolverMuJoCo derives the second anchor at the reference joint configuration,
 retaining the imported poses of static bodies that are not visited by forward
-kinematics. Use native equality import
-(``convert_mjc_equality_constraints=False``) for these standalone static endpoints.
+kinematics. CONNECT/WELD constraints with world, standalone zero-mass, or standalone
+world-fixed endpoints remain native SolverMuJoCo equalities even with the default
+``convert_mjc_equality_constraints=True``; no Newton loop joint is created for
+them. A standalone fixed joint to world identifies static hardware independently
+of its inferred collider mass. Dynamic-body CONNECT constraints retain loop-joint
+conversion. Bodies inside articulations are not classified as standalone static
+endpoints. No explicit SolverMuJoCo custom-attribute registration is required
+before importing these native equality rows.
+
+Static ``UsdGeom.Xformable`` endpoint prims and sites without a rigid-body
+ancestor resolve to world while retaining their relationship targets. Their
+anchors include the composed USD affine transform (including referenced root
+placement and scale) and the incoming ``add_usd(xform=...)`` transform.
+Missing/non-transformable targets and filtered rigid-body targets remain
+unresolved rather than silently becoming world anchors. As with other legacy
+rigid USD import, non-unit ``metersPerUnit`` emits an unsupported-units warning;
+it does not implicitly rescale rigid coordinates.
+
+``MjcEqualityWeldAPI`` additionally transforms static joint-frame rotations and
+authored local offsets before computing the native relative pose and second-body
+anchor. Rotation is extracted from the full composed joint frame with USD's
+``RemoveScaleShear`` rule, while translation retains the full affine local-offset
+transform. Site shapes outside rigid bodies remain available to site actuators
+when ``load_sites=True``, independently of either visual-loading flag.
+
+When one articulation descriptor contains several world-facing branches, all
+structural-joint endpoints are discovered before building the joint graph.
+Each world-facing joint receives incoming placement and root rebasing; an
+explicit floating/fixed mobility override still applies only to the first root.
+Dynamic-parent joint frames and excluded loop ownership are unchanged.
 
 Particle Simulation Geometry
 ----------------------------

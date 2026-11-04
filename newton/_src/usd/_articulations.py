@@ -129,7 +129,22 @@ def _parse_articulations(
         art_bodies = []
         if verbose:
             logger.info("Bodies under articulation %s:%s", path, "".join(f"\n\t{p!s}" for p in desc.articulatedBodies))
-        for p in desc.articulatedBodies:
+        # OpenUSD can report every world-facing joint but only one root's bodies.
+        # Complete structural endpoints without claiming equality/loop endpoints.
+        articulated_body_paths = list(desc.articulatedBodies)
+        articulated_body_keys = {str(p) for p in articulated_body_paths}
+        for joint_path in desc.articulatedJoints:
+            if str(joint_path) in mjc_equality_connect_or_weld_paths:
+                continue
+            joint_desc = joint_descriptions[str(joint_path)]
+            if joint_desc.excludeFromArticulation:
+                continue
+            for body_path in (joint_desc.body0, joint_desc.body1):
+                key = str(body_path)
+                if key in body_specs and key not in articulated_body_keys:
+                    articulated_body_paths.append(body_path)
+                    articulated_body_keys.add(key)
+        for p in articulated_body_paths:
             if p == Sdf.Path.emptyPath:
                 continue
             key = str(p)
@@ -329,10 +344,10 @@ def _parse_articulations(
 
             # insert the remaining joints in topological order
             for joint_id, i in enumerate(sorted_joints):
-                if joint_id == 0 and first_joint_parent == -1:
-                    # The root joint connects to the world (parent_id=-1).
-                    # If base_joint or floating is specified, override the USD's root joint.
-                    if base_joint is not None or floating is not None:
+                if joint_edges[i][0] == -1:
+                    # Place every world-facing root, but override mobility only
+                    # for the first root, preserving the existing API contract.
+                    if joint_id == 0 and (base_joint is not None or floating is not None):
                         # Get the child body of the root joint
                         root_joint_child = joint_edges[sorted_joints[0]][1]
                         if bodies_follow_joint_ordering:
