@@ -171,18 +171,28 @@ class TestUsdCollisionMasks(unittest.TestCase):
                 expected = set(map(tuple, model.shape_contact_pairs.numpy()))
                 self.assertEqual(actual, expected)
 
-    def test_partial_static_filter_above_compiler_cap_fails_closed(self):
-        """Reject an unrepresentable partial-owner filter without enabling extra contacts."""
+    def test_partial_static_filter_above_compiler_cap_uses_exact_coloring(self):
+        """Preserve a representable partial-owner filter without excluding its other shapes."""
         stage = self._stage([[(1, 0)] * 257, [(0, 1)]])
         stage.GetPrimAtPath("/body1").RemoveAPI(UsdPhysics.RigidBodyAPI)
         UsdPhysics.FilteredPairsAPI.Apply(stage.GetPrimAtPath("/body0/shape0")).CreateFilteredPairsRel().AddTarget(
             Sdf.Path("/body1/shape0")
         )
         builder = self._builder()
-        builder.add_usd(stage, load_visual_shapes=False)
+        result = builder.add_usd(stage, load_visual_shapes=False)
         model = builder.finalize(device="cpu")
-        with self.assertRaisesRegex(ValueError, "Cannot represent Newton collision filters exactly"):
-            self._solver(model)
+        solver = self._solver(model)
+        shapes = result["path_shape_map"]
+        wire = shapes["/body1/shape0"]
+        self.assertFalse(self._masks_allow(solver, shapes["/body0/shape0"], wire))
+        for index in range(1, 257):
+            self.assertTrue(self._masks_allow(solver, shapes[f"/body0/shape{index}"], wire))
+        mapping = solver.mjc_geom_to_newton_shape.numpy()[0]
+        actual = {
+            tuple(sorted((int(mapping[contact.geom1]), int(mapping[contact.geom2]))))
+            for contact in solver.mj_data.contact[: solver.mj_data.ncon]
+        }
+        self.assertEqual(actual, set(map(tuple, model.shape_contact_pairs.numpy())))
 
     def test_connect_anchors_with_filtered_static_wire(self):
         """Keep CONNECT world anchors unchanged when a filtered static wire gains a native body."""
