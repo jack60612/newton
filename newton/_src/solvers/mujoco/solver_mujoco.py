@@ -34,6 +34,7 @@ from ...sim import (
 from ...sim.articulation import eval_fk
 from ...sim.collide import _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
+from ...sim.graph_coloring import color_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
@@ -5474,9 +5475,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
     def _compile_newton_collision_masks(model: Model, selected_shapes: np.ndarray):
         """Compile selected Newton groups and filters into MuJoCo masks."""
         groups = model.shape_collision_group.numpy()[selected_shapes]
-        # The exact compiler materializes a dense pair graph. Report its size
-        # limit before even reading sparse filters; native contacts must fail
-        # closed rather than falling back to approximate collision colors.
+        # The exact compiler materializes a dense pair graph. Report its bounds
+        # before reading sparse filters; a separately verified coloring may still
+        # represent larger graphs without changing their native contact set.
         if selected_shapes.shape[0] > NEWTON_COLLISION_MASK_MAX_SHAPE_COUNT:
             return compile_newton_collision_graph(groups)
 
@@ -5487,6 +5488,82 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         filtered = model.shape_collision_filter_mask(candidate_pairs)
         local_filter_pairs = np.column_stack((shape_a[filtered], shape_b[filtered]))
         return compile_newton_collision_graph(groups, excluded_pairs=local_filter_pairs)
+
+    @staticmethod
+    def _compile_exact_collision_color_masks(
+        model: Model,
+        selected_shapes: np.ndarray,
+        body_filters: Iterable[tuple[int, int]],
+        static_body_filters: Iterable[tuple[int, int]],
+    ) -> tuple[np.ndarray, np.ndarray] | None:
+        """Return a <=32-color encoding only when native excludes make it exact."""
+        shape_a, shape_b = np.triu_indices(len(selected_shapes), k=1)
+        pairs = np.column_stack((selected_shapes[shape_a], selected_shapes[shape_b]))
+        filtered = model.shape_collision_filter_mask(pairs)
+        groups = model.shape_collision_group.numpy()[selected_shapes]
+        group_a, group_b = groups[shape_a], groups[shape_b]
+        allowed = (group_a != 0) & (group_b != 0)
+        allowed &= ((group_a > 0) & ((group_a == group_b) | (group_b < 0))) | ((group_a < 0) & (group_a != group_b))
+        allowed &= ~filtered
+        bodies = model.shape_body.numpy()[selected_shapes]
+        # MuJoCo cannot generate same-body contacts, including world/world.
+        allowed &= bodies[shape_a] != bodies[shape_b]
+        body_filter_set = {tuple(sorted((int(a), int(b)))) for a, b in body_filters}
+        static_filter_set = set(static_body_filters)
+
+        def native_excluded(a: int, b: int) -> bool:
+            body_a, body_b = int(bodies[a]), int(bodies[b])
+            return (
+                body_a == body_b
+                or tuple(sorted((body_a, body_b))) in body_filter_set
+                or (body_a < 0 and (int(selected_shapes[a]), body_b) in static_filter_set)
+                or (body_b < 0 and (int(selected_shapes[b]), body_a) in static_filter_set)
+            )
+
+        # A forbidden pair without a native exclusion must share a color.
+        # Contract those equalities before coloring required-contact edges.
+        parents = np.arange(len(selected_shapes))
+
+        def find(shape: int) -> int:
+            while parents[shape] != shape:
+                parents[shape] = parents[parents[shape]]
+                shape = int(parents[shape])
+            return shape
+
+        for index in np.flatnonzero(~allowed):
+            a, b = int(shape_a[index]), int(shape_b[index])
+            if not native_excluded(a, b):
+                parents[find(a)] = find(b)
+        roots = np.asarray([find(shape) for shape in range(len(selected_shapes))])
+        _, components = np.unique(roots, return_inverse=True)
+        edge_a, edge_b = components[shape_a[allowed]], components[shape_b[allowed]]
+        if np.any(edge_a == edge_b):
+            return None
+        edges = np.unique(np.column_stack((np.minimum(edge_a, edge_b), np.maximum(edge_a, edge_b))), axis=0).astype(
+            np.int32
+        )
+        color_groups = color_graph(
+            num_nodes=len(np.unique(components)),
+            graph_edge_indices=wp.array(edges, dtype=wp.int32, device="cpu"),
+            balance_colors=False,
+        )
+        if len(color_groups) > 32:
+            return None
+        component_colors = np.zeros(len(roots), dtype=np.uint32)
+        for color, component_group in enumerate(color_groups):
+            component_colors[component_group] = color
+        colors = component_colors[components]
+        native_allowed = (colors[shape_a] != colors[shape_b]) & (bodies[shape_a] != bodies[shape_b])
+        if np.any(allowed & ~native_allowed):
+            return None
+        # Proper coloring alone can introduce filtered cross-color contacts.
+        # Accept only when every extra pair has an emitted native exclusion.
+        for index in np.flatnonzero(native_allowed & ~allowed):
+            a, b = int(shape_a[index]), int(shape_b[index])
+            if not native_excluded(a, b):
+                return None
+        collision_type = np.left_shift(np.uint32(1), colors)
+        return collision_type, ~collision_type
 
     @staticmethod
     def _preserved_masks_cover_collision_filters(
@@ -6249,19 +6326,27 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         compiled_collision_affinity = None
         if not use_preserved_collision_masks:
             compiled_masks = self._compile_newton_collision_masks(model, colliding_shapes)
+            colored_masks = None
             if not compiled_masks.exact and self._use_mujoco_contacts:
-                raise ValueError(
-                    "Cannot represent Newton collision filters exactly in MuJoCo masks "
-                    f"({len(colliding_shapes)} colliding shapes, {compiled_masks.bit_count} mask bits; "
-                    f"compiler skipped={compiled_masks.skipped}). "
-                    "Use authored masks with body-level exclusions or Newton-generated contacts; "
-                    "lossy collision-color fallback is not supported."
+                colored_masks = self._compile_exact_collision_color_masks(
+                    model, colliding_shapes, body_filters, static_body_filters
                 )
+                if colored_masks is None:
+                    raise ValueError(
+                        "Cannot represent Newton collision filters exactly in MuJoCo masks "
+                        f"({len(colliding_shapes)} colliding shapes, {compiled_masks.bit_count} mask bits; "
+                        f"compiler skipped={compiled_masks.skipped}). "
+                        "No exact <=32-color encoding with native exclusions was found. "
+                        "Use authored masks with body-level exclusions or Newton-generated contacts."
+                    )
             compiled_collision_type = np.zeros(model.shape_count, dtype=np.uint32)
             compiled_collision_affinity = np.zeros(model.shape_count, dtype=np.uint32)
             if compiled_masks.exact:
                 compiled_collision_type[colliding_shapes] = compiled_masks.collision_type
                 compiled_collision_affinity[colliding_shapes] = compiled_masks.collision_affinity
+            elif colored_masks is not None:
+                compiled_collision_type[colliding_shapes] = colored_masks[0]
+                compiled_collision_affinity[colliding_shapes] = colored_masks[1]
             # Newton-generated contacts do not use MuJoCo's automatic masks.
             # Keep them disabled if no exact automatic representation exists.
 
