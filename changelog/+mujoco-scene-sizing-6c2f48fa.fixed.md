@@ -1,0 +1,1 @@
+Size automatic MuJoCo-Warp contact and constraint capacities from finalized rigid-scene topology, including inactive equalities, unengaged limits, and future eligible contacts, while preserving explicit capacity semantics.

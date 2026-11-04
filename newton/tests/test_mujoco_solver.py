@@ -36,6 +36,7 @@ from newton._src.solvers.mujoco.enums import (
 from newton._src.solvers.mujoco.equality import _add_equality_constraint
 from newton._src.solvers.mujoco.geometry import build_shape_layout, compile_layout_collision_masks
 from newton._src.solvers.mujoco.kernels import convert_solref, update_body_inertia_kernel
+from newton._src.solvers.mujoco.sizing import _scene_constraint_capacity, _structural_constraint_rows
 from newton._src.solvers.mujoco.utils import MJC_OBJ_BODY, MJC_OBJ_JOINT, MjcEqualityTargetKind
 from newton.examples import get_asset
 from newton.exceptions import NewtonDeprecationWarning, NewtonWarning
@@ -5013,7 +5014,25 @@ class TestMuJoCoSolverNewtonContacts(unittest.TestCase):
             self.skipTest(f"MuJoCo or deps not installed. Skipping test: {e}")
 
         self.assertGreaterEqual(solver.mjw_data.naconmax, model.rigid_contact_max)
-        self.assertEqual(solver.mjw_data.njmax, baseline_solver.mjw_data.njmax)
+
+        # Native sphere-plane collision has one contact, while Newton's
+        # conservative primitive-pair budget reserves five. Structural rows
+        # include potential constraints, rather than only initially active rows.
+        # Both allocations are per world, not multiplied by the cloned worlds.
+        native_rows, native_contacts = _scene_constraint_capacity(baseline_solver.mj_model, baseline_solver.mjw_model)
+        self.assertEqual(native_contacts, 1)
+        self.assertEqual(baseline_solver.mjw_data.njmax, native_rows)
+        max_contact_dim = max(
+            1,
+            int(np.max(solver.mj_model.geom_condim, initial=1)),
+            int(np.max(solver.mj_model.pair_dim, initial=1)),
+        )
+        rows_per_contact = max(1, 2 * (max_contact_dim - 1))
+        self.assertEqual(
+            solver.mjw_data.njmax,
+            _structural_constraint_rows(solver.mj_model) + 5 * rows_per_contact,
+        )
+        self.assertGreaterEqual(solver.mjw_data.njmax, baseline_solver.mjw_data.njmax)
 
     def test_sphere_rolls_without_slip_with_newton_contacts(self):
         radius = 0.1
@@ -8461,7 +8480,9 @@ class TestMuJoCoOptions(unittest.TestCase):
     def test_native_cpu_observable_capabilities(self):
         """Validate native observable support for each integrator family."""
         model = self._create_multiworld_model(world_count=1)
-        solver = SolverMuJoCo(model, use_mujoco_cpu=True)
+        # Explicitly reserve a positive export capacity so the undersized
+        # Contacts fixture remains valid even when this scene has no eligible pairs.
+        solver = SolverMuJoCo(model, use_mujoco_cpu=True, nconmax=1)
         for kind in (
             solver.ObservableKind.BODY_QDD,
             solver.ObservableKind.BODY_PARENT_F,
