@@ -60,8 +60,8 @@ class TestMuJoCoSolver(unittest.TestCase):
         """
         self.assertTrue(True, "setUp method completed.")
 
-    def test_collision_coloring_uses_all_32_mujoco_mask_bits(self):
-        """Verify that graph-color fallback uses bits 0 through 31 before degrading to MuJoCo defaults."""
+    def test_collision_mask_compiler_limits_fail_closed(self):
+        """Reject inexact native masks instead of degrading to collide-all colors."""
         clique_size = 33
         isolated_shape_count = 24
         shape_count = clique_size + isolated_shape_count
@@ -72,31 +72,17 @@ class TestMuJoCoSolver(unittest.TestCase):
             joint = builder.add_joint_free(body)
             builder.add_articulation([joint])
 
-        # The 33-shape clique requires 33 colors. Isolating another 24 shapes
-        # creates more than 1,024 sparse exclusions, which also forces the
-        # legacy fallback when the bounded mask compiler from #3714 is used.
+        # More than 1,024 sparse exclusions force the bounded compiler to skip.
+        # Native conversion must reject this case rather than enable forbidden
+        # contacts when the allowed clique needs more than 32 colors.
         colliding_pairs = set(itertools.combinations(range(clique_size), 2))
         for pair in itertools.combinations(range(shape_count), 2):
             if pair not in colliding_pairs:
                 builder.add_shape_collision_filter_pair(*pair)
 
         model = builder.finalize(device="cpu")
-        colors = SolverMuJoCo._color_collision_shapes(model, np.arange(model.shape_count))
-        np.testing.assert_array_equal(np.sort(np.unique(colors)), np.arange(33))
-
-        solver = SolverMuJoCo(model, use_mujoco_cpu=True)
-        expected_masks = {SolverMuJoCo._collision_color_masks(color) for color in range(33)}
-        actual_masks = {
-            (int(contype), int(conaffinity))
-            for contype, conaffinity in zip(
-                solver.mj_model.geom_contype,
-                solver.mj_model.geom_conaffinity,
-                strict=True,
-            )
-        }
-        self.assertEqual(actual_masks, expected_masks)
-        self.assertIn((-2147483648, 2147483647), actual_masks)
-        self.assertIn((1, 1), actual_masks)
+        with self.assertRaisesRegex(ValueError, "Cannot represent Newton collision filters exactly"):
+            SolverMuJoCo(model, use_mujoco_cpu=True)
 
     def test_tolerance_options(self):
         """Test that tolerance and ls_tolerance options are properly set on the MuJoCo Warp model."""
