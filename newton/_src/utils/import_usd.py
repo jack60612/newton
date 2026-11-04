@@ -1002,9 +1002,7 @@ def parse_usd(
             and not default_prim.HasAPI(UsdPhysics.RigidBodyAPI)
         )
 
-    def _get_target_body_and_local_pos(
-        target_path: str, world_local_pos: wp.vec3
-    ) -> tuple[int, wp.vec3] | None:
+    def _get_target_body_and_local_pos(target_path: str, world_local_pos: wp.vec3) -> tuple[int, wp.vec3] | None:
         """Resolve a target to its body index and body-local position."""
         if _is_world_target(target_path):
             if target_path in ("", "/"):
@@ -1493,17 +1491,28 @@ def parse_usd(
                 )
             return
 
-        prim_world_mat = _get_prim_world_mat(
-            prim,
-            articulation_root_xform,
-            incoming_world_xform if (parent_body_id == -1 or body_xform is not None) else None,
-        )
-        if body_xform is not None:
-            # Use the body transform used by the builder to avoid USD/physics pose mismatches.
-            body_world_mat = _xform_to_mat44(body_xform)
-            rel_mat = wp.inverse(body_world_mat) @ prim_world_mat
+        if is_site and body_xform is not None:
+            # As for CONNECT target sites, subtract world poses in USD double
+            # precision before the final Warp cast. Incoming/rebase rigid
+            # transforms cancel in body-local coordinates.
+            body_path = _get_rigid_body_ancestor_path(prim)
+            assert body_path is not None
+            body_prim = stage.GetPrimAtPath(body_path)
+            body_world = xform_cache.GetLocalToWorldTransform(body_prim).RemoveScaleShear()
+            site_world = xform_cache.GetLocalToWorldTransform(prim)
+            rel_mat = wp.mat44(np.asarray(site_world * body_world.GetInverse()).T)
         else:
-            rel_mat = prim_world_mat
+            prim_world_mat = _get_prim_world_mat(
+                prim,
+                articulation_root_xform,
+                incoming_world_xform if (parent_body_id == -1 or body_xform is not None) else None,
+            )
+            if body_xform is not None:
+                # Visuals follow the body transform actually used by the builder.
+                body_world_mat = _xform_to_mat44(body_xform)
+                rel_mat = wp.inverse(body_world_mat) @ prim_world_mat
+            else:
+                rel_mat = prim_world_mat
 
         xform_pos, xform_rot, scale = wp.transform_decompose(rel_mat)
         xform = wp.transform(xform_pos, xform_rot)
@@ -4953,9 +4962,7 @@ def parse_usd(
             for body in (builder.joint_parent[joint], builder.joint_child[joint])
         }
         static_equality_bodies = {
-            body
-            for body, mass in enumerate(builder.body_mass)
-            if mass <= 0.0 and body not in articulated_bodies
+            body for body, mass in enumerate(builder.body_mass) if mass <= 0.0 and body not in articulated_bodies
         }
         # Collider-derived mass does not make a world-fixed body dynamic.
         # USD exporters can omit mass/density on otherwise static hardware.
@@ -5058,11 +5065,7 @@ def parse_usd(
                 if is_connect:
                     # Rigid-body local poses remain authoritative; static/world
                     # endpoints already include their authored/import transforms.
-                    anchor = (
-                        wp.vec3(*joint_desc.localPose0Position)
-                        if target0 in path_body_map
-                        else site0_local_pos
-                    )
+                    anchor = wp.vec3(*joint_desc.localPose0Position) if target0 in path_body_map else site0_local_pos
                     # Standalone static/world endpoints have no articulation loop
                     # target. Preserve their authoritative native equality instead.
                     convert_connect = convert_mjc_equality_constraints and not (
@@ -5104,11 +5107,7 @@ def parse_usd(
                         local_pos1, local_rot1 = world_pose1.p, world_pose1.q
                     # Native WELD anchors live in the second endpoint's frame.
                     # Static endpoints use their complete transformed joint pose.
-                    anchor = (
-                        local_pos1
-                        if body1_idx < 0 or target1 in path_body_map
-                        else site1_local_pos
-                    )
+                    anchor = local_pos1 if body1_idx < 0 or target1 in path_body_map else site1_local_pos
                     relpose_rot = local_rot0 * wp.quat_inverse(local_rot1)
                     relpose_pos = local_pos0 - wp.quat_rotate(relpose_rot, local_pos1)
                     torquescale_attr = joint_prim.GetAttribute("mjc:torqueScale")
