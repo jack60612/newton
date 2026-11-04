@@ -1033,7 +1033,10 @@ class ForwardKinematicsSolver:
             ValueError: If an FK actuation override is invalid.
         """
         if not flags & (
-            ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_DOF_FORCE_PROPERTIES | ModelFlags.ACTUATOR_PROPERTIES
+            ModelFlags.JOINT_DOF_PROPERTIES
+            | ModelFlags.JOINT_DOF_FORCE_PROPERTIES
+            | ModelFlags.ACTUATOR_PROPERTIES
+            | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES
         ):
             return
         joint_count = self.model.size.sum_of_num_joints

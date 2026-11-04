@@ -118,6 +118,7 @@ from .kernels import (
     update_eq_data_and_active_kernel,
     update_eq_properties_kernel,
     update_geom_properties_kernel,
+    update_jnt_effort_limits_kernel,
     update_jnt_properties_kernel,
     update_jnt_reference_kernel,
     update_jnt_solref_from_invweight0_kernel,
@@ -5872,6 +5873,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._update_joint_dof_force_properties()
             # Defer host validation during capture until the next eager solref update.
             self._raw_solreflimit_validated = False
+        elif flags & ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES:
+            self._update_joint_effort_limits()
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._update_geom_properties()
             self._update_site_properties()
@@ -5933,6 +5936,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_model.jnt_stiffness[:] = self.mjw_model.jnt_stiffness.numpy()[0]
                 self.mj_model.jnt_margin[:] = self.mjw_model.jnt_margin.numpy()[0]
                 self.mj_model.jnt_range[:] = self.mjw_model.jnt_range.numpy()[0]
+            if update_force or flags & ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES:
                 self.mj_model.jnt_actfrcrange[:] = self.mjw_model.jnt_actfrcrange.numpy()[0]
             if flags & ModelFlags.ACTUATOR_PROPERTIES and self.mjc_actuator_ctrl_source is not None:
                 self.mj_model.actuator_ctrlrange[:] = self.mjw_model.actuator_ctrlrange.numpy()[0]
@@ -10354,6 +10358,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 d.qpos,
             ],
             outputs=[m.eq_data],
+            device=self.model.device,
+        )
+
+    def _update_joint_effort_limits(self):
+        """Copy runtime force bounds; they do not change MuJoCo reference-pose constants."""
+        if self.model.joint_dof_count == 0:
+            return
+        wp.launch(
+            update_jnt_effort_limits_kernel,
+            dim=self.mjc_jnt_to_newton_dof.shape,
+            inputs=[self.mjc_jnt_to_newton_dof, self.model.joint_effort_limit],
+            outputs=[self.mjw_model.jnt_actfrcrange],
             device=self.model.device,
         )
 

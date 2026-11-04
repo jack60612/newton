@@ -60,6 +60,9 @@ class ModelFlags(IntEnum):
         Body variants, including this flag, may change without a deprecation period.
     """
 
+    JOINT_EFFORT_LIMIT_PROPERTIES = 1 << 13
+    """Indicates only joint_effort_limit updates; the DOF and DOF force flags also cover these updates."""
+
     ALL = (
         JOINT_PROPERTIES
         | JOINT_DOF_PROPERTIES
@@ -74,6 +77,7 @@ class ModelFlags(IntEnum):
         | JOINT_DOF_INERTIAL_PROPERTIES
         | JOINT_REFERENCE_POSE_PROPERTIES
         | SHAPE_TYPE_AND_SOURCE
+        | JOINT_EFFORT_LIMIT_PROPERTIES
     )
     """Indicates all property updates."""
 
