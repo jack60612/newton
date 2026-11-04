@@ -2260,14 +2260,23 @@ def parse_usd(
 
     add_base_articulations(bodies_to_articulate)
 
-    def initialize_free_joint_velocities() -> None:
-        imported_bodies = set(path_body_map.values())
+    def initialize_free_joint_properties() -> None:
+        imported_body_paths = {body_id: path for path, body_id in path_body_map.items()}
         for joint_id, joint_type in enumerate(builder.joint_type):
             if joint_type != JointType.FREE:
                 continue
             child = builder.joint_child[joint_id]
-            if child not in imported_bodies:
+            if child not in imported_body_paths:
                 continue
+
+            # A floating USD body has no joint prim. Its per-axis armature
+            # attributes describe the generated FREE joint, not body inertia.
+            body_prim = stage.GetPrimAtPath(imported_body_paths[child])
+            qd_start = builder.joint_qd_start[joint_id]
+            for axis_index, axis_name in enumerate(("transX", "transY", "transZ", "rotX", "rotY", "rotZ")):
+                armature = R.get_value(body_prim, PrimType.BODY, f"{axis_name}_armature")
+                if armature is not None:
+                    builder.joint_armature[qd_start + axis_index] = armature
 
             child_qd = builder.body_qd[child]
             linear_velocity = wp.spatial_top(child_qd)
@@ -2771,7 +2780,7 @@ def parse_usd(
             if old_label is not None and old_label in new_label_to_idx:
                 path_joint_map[path] = new_label_to_idx[old_label]
 
-    initialize_free_joint_velocities()
+    initialize_free_joint_properties()
 
     # Mimic constraints from PhysxMimicJointAPI (run after collapse so joint indices are final).
     # PhysxMimicJointAPI is an instance-applied schema (e.g. PhysxMimicJointAPI:rotZ)
