@@ -1,0 +1,1 @@
+Add `ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES` for runtime joint force-bound edits and refresh MuJoCo per-world actuator-force ranges without recomputing reference-pose constants. Preserve broad DOF updates, sleeping-world wake-up, coupled-model projection, and Kamino structural validation.

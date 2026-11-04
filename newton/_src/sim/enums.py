@@ -40,6 +40,9 @@ class ModelFlags(IntEnum):
     ACTUATOR_PROPERTIES = 1 << 8
     """Indicates actuator property updates: gains, biases, limits, etc."""
 
+    JOINT_EFFORT_LIMIT_PROPERTIES = 1 << 9
+    """Indicates only joint_effort_limit updates; JOINT_DOF_PROPERTIES also covers these updates."""
+
     ALL = (
         JOINT_PROPERTIES
         | JOINT_DOF_PROPERTIES
@@ -50,6 +53,7 @@ class ModelFlags(IntEnum):
         | CONSTRAINT_PROPERTIES
         | TENDON_PROPERTIES
         | ACTUATOR_PROPERTIES
+        | JOINT_EFFORT_LIMIT_PROPERTIES
     )
     """Indicates all property updates."""
 

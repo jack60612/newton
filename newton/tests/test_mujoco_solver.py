@@ -916,6 +916,70 @@ class TestMuJoCoSolverMassProperties(TestMuJoCoSolverPropertiesBase):
 
 
 class TestMuJoCoSolverJointProperties(TestMuJoCoSolverPropertiesBase):
+    def test_effort_only_notification_preserves_constants_and_matches_broad_update(self):
+        """Distinct per-world and subset force bounds need no reference-pose recomputation."""
+        for use_cpu in (False, True):
+            with self.subTest(use_mujoco_cpu=use_cpu):
+                sleeping = not use_cpu and self.model.device.is_cuda
+                solver = SolverMuJoCo(
+                    self.model, use_mujoco_cpu=use_cpu, separate_worlds=True, enable_sleeping=sleeping
+                )
+                broad = SolverMuJoCo(self.model, use_mujoco_cpu=use_cpu, separate_worlds=True)
+                mapping = solver.mjc_jnt_to_newton_dof.numpy()
+                valid = mapping >= 0
+                constants = {
+                    name: getattr(solver.mjw_model, name).numpy().copy()
+                    for name in ("dof_invweight0", "body_subtreemass", "qpos0", "jnt_range", "jnt_solref")
+                }
+                limited = solver.mj_model.jnt_actfrclimited.copy()
+                limits = self.model.joint_effort_limit.numpy().copy()
+                for iteration in range(3):
+                    # First update every DOF; then change a different world/joint subset.
+                    if iteration == 0:
+                        limits[:] = 1.0 + np.arange(len(limits), dtype=np.float32) * 0.125
+                    else:
+                        selected = np.unique(mapping[iteration - 1][mapping[iteration - 1] >= 0])
+                        limits[selected[::2]] += iteration * 0.25
+                    self.model.joint_effort_limit.assign(limits)
+                    with (
+                        patch.object(
+                            solver,
+                            "_set_const_0_with_physical_meaninertia",
+                            wraps=solver._set_const_0_with_physical_meaninertia,
+                        ) as const,
+                        patch.object(
+                            solver,
+                            "_wake_sleeping_worlds",
+                            wraps=solver._wake_sleeping_worlds,
+                        ) as wake,
+                    ):
+                        solver.notify_model_changed(ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES)
+                        const.assert_not_called()
+                        self.assertEqual(wake.call_count, int(sleeping))
+                    actual = solver.mjw_model.jnt_actfrcrange.numpy()
+                    np.testing.assert_allclose(actual[..., 0][valid], -limits[mapping[valid]])
+                    np.testing.assert_allclose(actual[..., 1][valid], limits[mapping[valid]])
+                    broad.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+                    np.testing.assert_array_equal(actual, broad.mjw_model.jnt_actfrcrange.numpy())
+                    np.testing.assert_array_equal(solver.mj_model.jnt_actfrclimited, limited)
+                    if use_cpu:
+                        np.testing.assert_array_equal(solver.mj_model.jnt_actfrcrange, actual[0])
+                    for name, original in constants.items():
+                        np.testing.assert_array_equal(getattr(solver.mjw_model, name).numpy(), original)
+
+                # Genuine gains / position limits keep the broad refresh contract.
+                for property_name in ("joint_target_ke", "joint_limit_upper"):
+                    values = getattr(self.model, property_name).numpy().copy()
+                    values[mapping[valid]] += 0.1
+                    getattr(self.model, property_name).assign(values)
+                    with patch.object(
+                        solver,
+                        "_set_const_0_with_physical_meaninertia",
+                        wraps=solver._set_const_0_with_physical_meaninertia,
+                    ) as const:
+                        solver.notify_model_changed(ModelFlags.JOINT_DOF_PROPERTIES)
+                        const.assert_called_once()
+
     def test_joint_attributes_registration_and_updates(self):
         """
         Verify that joint effort limit, velocity limit, armature, and friction:

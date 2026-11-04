@@ -101,6 +101,7 @@ from .kernels import (
     update_geom_properties_kernel,
     update_jnt_connect_constraint_anchors_kernel,
     update_jnt_connect_constraint_rel_body_poses_at_qref_kernel,
+    update_jnt_effort_limits_kernel,
     update_jnt_properties_kernel,
     update_jnt_solref_from_invweight0_kernel,
     update_joint_transforms_kernel,
@@ -114,6 +115,7 @@ from .kernels import (
     update_tendon_properties_kernel,
     wake_changed_trees_kernel,
 )
+from .sizing import _scene_constraint_capacity, _structural_constraint_rows
 from .utils import solref_invalid_mask
 
 if TYPE_CHECKING:
@@ -4883,6 +4885,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._raw_solreflimit_validated = False
             need_const_0 = True
             need_length_range = True
+        elif flags & ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES:
+            self._update_joint_effort_limits()
         if flags & ModelFlags.SHAPE_PROPERTIES:
             self._update_geom_properties()
             self._update_site_properties()
@@ -4935,6 +4939,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self.mj_model.jnt_stiffness[:] = self.mjw_model.jnt_stiffness.numpy()[0]
                 self.mj_model.jnt_margin[:] = self.mjw_model.jnt_margin.numpy()[0]
                 self.mj_model.jnt_range[:] = self.mjw_model.jnt_range.numpy()[0]
+            if flags & (ModelFlags.JOINT_DOF_PROPERTIES | ModelFlags.JOINT_EFFORT_LIMIT_PROPERTIES):
                 self.mj_model.jnt_actfrcrange[:] = self.mjw_model.jnt_actfrcrange.numpy()[0]
             if need_length_range or need_const_fixed or need_const_0:
                 self._set_const_0_with_physical_meaninertia()
@@ -7867,8 +7872,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             else:
                 nworld = 1
 
-            from .sizing import _scene_constraint_capacity, _structural_constraint_rows
-
             if disable_contacts:
                 nconmax = 0
                 if njmax is None:
@@ -8387,6 +8390,18 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 apply_kinematic_armature,
             ],
             outputs=[self.mjw_model.dof_armature],
+            device=self.model.device,
+        )
+
+    def _update_joint_effort_limits(self):
+        """Copy runtime force bounds; they do not change MuJoCo reference-pose constants."""
+        if self.model.joint_dof_count == 0:
+            return
+        wp.launch(
+            update_jnt_effort_limits_kernel,
+            dim=self.mjc_jnt_to_newton_dof.shape,
+            inputs=[self.mjc_jnt_to_newton_dof, self.model.joint_effort_limit],
+            outputs=[self.mjw_model.jnt_actfrcrange],
             device=self.model.device,
         )
 
