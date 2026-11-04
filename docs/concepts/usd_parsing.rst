@@ -43,6 +43,16 @@ Revolute ``mjc:ref`` and ``mjc:springref`` instead follow the PhysicsScene's
 ``mjc:compiler:angle`` setting (degrees by default). The importer converts these
 values to radians or radians/s.
 
+MuJoCo CONNECT anchors
+----------------------
+
+``MjcEqualityConnectAPI`` constraints preserve body-local anchors, including
+endpoints on standalone static bodies with translated or rotated USD frames.
+SolverMuJoCo derives the second anchor at the reference joint configuration,
+retaining the imported poses of static bodies that are not visited by forward
+kinematics. Use native equality import
+(``convert_mjc_equality_constraints=False``) for these standalone static endpoints.
+
 Particle Simulation Geometry
 ----------------------------
 
