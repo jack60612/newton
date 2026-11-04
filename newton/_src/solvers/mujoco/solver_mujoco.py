@@ -34,7 +34,6 @@ from ...sim import (
 from ...sim.articulation import eval_fk
 from ...sim.collide import _estimate_rigid_contact_max, _estimate_rigid_contact_max_per_world
 from ...sim.contacts import GENERATION_SENTINEL as _GENERATION_SENTINEL
-from ...sim.graph_coloring import color_graph, plot_graph
 from ...utils import topological_sort
 from ...utils.benchmark import event_scope
 from ...utils.import_utils import string_to_warp
@@ -5439,12 +5438,46 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         return [(selected_bodies[bodies_a[k]], selected_bodies[bodies_b[k]]) for k in np.flatnonzero(excluded)]
 
     @staticmethod
+    def _find_static_collision_filter_pairs(
+        model: Model, selected_shapes: np.ndarray
+    ) -> list[tuple[int, int]]:
+        """Find world-owned shape/whole-body filters representable as native excludes."""
+        shape_body = model.shape_body.numpy()
+        if not np.any(shape_body[selected_shapes] < 0):
+            return []
+        selected = set(map(int, selected_shapes))
+        candidates = set()
+        for shape_a, shape_b in model.shape_collision_filter_pairs_array():
+            if shape_a not in selected or shape_b not in selected:
+                continue
+            body_a, body_b = int(shape_body[shape_a]), int(shape_body[shape_b])
+            if body_a < 0 <= body_b:
+                candidates.add((int(shape_a), body_b))
+            elif body_b < 0 <= body_a:
+                candidates.add((int(shape_b), body_a))
+        candidates = sorted(candidates)
+        pairs = []
+        counts = []
+        for shape, body in candidates:
+            shapes = [other for other in model.body_shapes[body] if other in selected]
+            counts.append(len(shapes))
+            pairs.extend((shape, other) for other in shapes)
+        if not pairs:
+            return []
+        filtered = model.shape_collision_filter_mask(np.asarray(pairs, dtype=np.int64))
+        counts = np.asarray(counts, dtype=np.int64)
+        ends = np.cumsum(counts)
+        unfiltered = np.concatenate(([0], np.cumsum(~filtered)))
+        complete = unfiltered[ends] == unfiltered[ends - counts]
+        return [candidates[index] for index in np.flatnonzero(complete)]
+
+    @staticmethod
     def _compile_newton_collision_masks(model: Model, selected_shapes: np.ndarray):
         """Compile selected Newton groups and filters into MuJoCo masks."""
         groups = model.shape_collision_group.numpy()[selected_shapes]
-        # The exact compiler materializes a dense pair graph. Enforce its size
-        # limit before even reading sparse filters; the fallback needs only the
-        # selected collision groups.
+        # The exact compiler materializes a dense pair graph. Report its size
+        # limit before even reading sparse filters; native contacts must fail
+        # closed rather than falling back to approximate collision colors.
         if selected_shapes.shape[0] > NEWTON_COLLISION_MASK_MAX_SHAPE_COUNT:
             return compile_newton_collision_graph(groups)
 
@@ -5463,6 +5496,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         collision_type: np.ndarray,
         collision_affinity: np.ndarray,
         body_filters: Iterable[tuple[int, int]],
+        static_body_filters: Iterable[tuple[int, int]] = (),
     ) -> bool:
         """Return whether preserved masks and body excludes cover Newton pair filters."""
         filter_pairs = model.shape_collision_filter_pairs_array()
@@ -5487,6 +5521,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             return True
 
         body_filter_set = {tuple(sorted((int(body_a), int(body_b)))) for body_a, body_b in body_filters}
+        static_filter_set = set(static_body_filters)
         shape_body = model.shape_body.numpy()
         for shape_a, shape_b in remaining_pairs:
             body_a = int(shape_body[shape_a])
@@ -5495,81 +5530,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # same body; whole-body Newton filters are emitted as excludes.
             if body_a == body_b or tuple(sorted((body_a, body_b))) in body_filter_set:
                 continue
+            if (body_a < 0 and (int(shape_a), body_b) in static_filter_set) or (
+                body_b < 0 and (int(shape_b), body_a) in static_filter_set
+            ):
+                continue
             return False
         return True
-
-    @staticmethod
-    def _color_collision_shapes(
-        model: Model, selected_shapes: np.ndarray, visualize_graph: bool = False, shape_labels: list[str] | None = None
-    ) -> np.ndarray:
-        """
-        Find a graph coloring of the collision filter pairs in the model.
-        Shapes within the same color cannot collide with each other.
-        Shapes can only collide with shapes of different colors.
-
-        Args:
-            model: The model to color the collision shapes of.
-            selected_shapes: The indices of the collision shapes to color.
-            visualize_graph: Whether to visualize the graph coloring.
-            shape_labels: The labels of the shapes, only used for visualization.
-
-        Returns:
-            np.ndarray: An integer array of shape (num_shapes,), where each element is the color of the corresponding shape.
-        """
-        # we first create a mapping from selected shape to local color shape index
-        # to reduce the number of nodes in the graph to only the number of selected shapes
-        # without any gaps between the indices (otherwise we have to allocate max(selected_shapes) + 1 nodes)
-        to_color_shape_index = {}
-        for i, shape in enumerate(selected_shapes):
-            to_color_shape_index[shape] = i
-        # find graph coloring of collision filter pairs
-        num_shapes = len(selected_shapes)
-        shape_a, shape_b = np.triu_indices(num_shapes, k=1)
-        shape_collision_group_np = model.shape_collision_group.numpy()
-        cgroup = shape_collision_group_np[selected_shapes]
-        # edges representing colliding shape pairs
-        candidate_pairs = np.stack((selected_shapes[shape_a], selected_shapes[shape_b]), axis=1)
-        filtered = model.shape_collision_filter_mask(candidate_pairs)
-        group_a, group_b = cgroup[shape_a], cgroup[shape_b]
-        group_allowed = (group_a != 0) & (group_b != 0)
-        group_allowed &= ((group_a > 0) & ((group_a == group_b) | (group_b < 0))) | (
-            (group_a < 0) & (group_a != group_b)
-        )
-        edge_mask = ~filtered & group_allowed
-        graph_edges = np.stack((shape_a[edge_mask], shape_b[edge_mask]), axis=1).astype(np.int32)
-        shape_color = np.zeros(model.shape_count, dtype=np.int32)
-        if len(graph_edges) > 0:
-            color_groups = color_graph(
-                num_nodes=num_shapes,
-                graph_edge_indices=wp.array(graph_edges, dtype=wp.int32),
-                balance_colors=False,
-            )
-            for color, group in enumerate(color_groups):
-                shape_color[selected_shapes[group]] = color
-            if visualize_graph:
-                plot_graph(
-                    vertices=np.arange(num_shapes),
-                    edges=graph_edges,
-                    node_labels=[shape_labels[i] for i in selected_shapes] if shape_labels is not None else None,
-                    node_colors=[shape_color[i] for i in selected_shapes],
-                )
-
-        return shape_color
-
-    @staticmethod
-    def _collision_color_masks(color: int) -> tuple[int, int]:
-        """Encode a collision color as signed MuJoCo ``contype`` and ``conaffinity`` masks."""
-        if color >= 32:
-            return 1, 1
-
-        uint32_mask = (1 << 32) - 1
-        contype = 1 << color
-        conaffinity = uint32_mask & ~contype
-
-        def as_signed_int32(mask: int) -> int:
-            return mask if mask < (1 << 31) else mask - (1 << 32)
-
-        return as_signed_int32(contype), as_signed_int32(conaffinity)
 
     def get_max_contact_count(self) -> int:
         """Return the maximum number of rigid contacts that can be generated by MuJoCo."""
@@ -6096,6 +6062,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         shape_mapping = {}
         # mapping from Newton shape id (sites) to MuJoCo site name
         site_mapping = {}
+        static_shape_bodies = {}
         # Store mapping from Newton joint index to MuJoCo joint name
         joint_mapping = {}
         # Store mapping from Newton body index to MuJoCo body name
@@ -6256,10 +6223,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             selected_bodies,
             colliding_shapes,
         )
+        static_body_filters = self._find_static_collision_filter_pairs(model, colliding_shapes)
+        filtered_static_shapes = {shape for shape, _ in static_body_filters}
 
-        # Reuse the original masks only when all shapes came from the same
-        # add_mjcf() call and the masks already enforce every Newton filter.
-        # Otherwise generate new masks from Newton's final allowed shape pairs.
+        # Preserve one authored mask domain when masks plus native body excludes
+        # enforce its filters. World-owned USD colliders need individual fixed
+        # bodies to express exclusions without excluding the entire world.
         use_preserved_collision_masks = (
             shape_mjc_contype is not None
             and shape_mjc_conaffinity is not None
@@ -6274,25 +6243,28 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 shape_mjc_contype,
                 shape_mjc_conaffinity,
                 body_filters,
+                static_body_filters,
             )
         )
         compiled_collision_type = None
         compiled_collision_affinity = None
-        shape_color = None
         if not use_preserved_collision_masks:
             compiled_masks = self._compile_newton_collision_masks(model, colliding_shapes)
+            if not compiled_masks.exact and self._use_mujoco_contacts:
+                raise ValueError(
+                    "Cannot represent Newton collision filters exactly in MuJoCo masks "
+                    f"({len(colliding_shapes)} colliding shapes, {compiled_masks.bit_count} mask bits; "
+                    f"compiler skipped={compiled_masks.skipped}). "
+                    "Use authored masks with body-level exclusions or Newton-generated contacts; "
+                    "lossy collision-color fallback is not supported."
+                )
+            compiled_collision_type = np.zeros(model.shape_count, dtype=np.uint32)
+            compiled_collision_affinity = np.zeros(model.shape_count, dtype=np.uint32)
             if compiled_masks.exact:
-                compiled_collision_type = np.zeros(model.shape_count, dtype=np.uint32)
-                compiled_collision_affinity = np.zeros(model.shape_count, dtype=np.uint32)
                 compiled_collision_type[colliding_shapes] = compiled_masks.collision_type
                 compiled_collision_affinity[colliding_shapes] = compiled_masks.collision_affinity
-            else:
-                shape_color = self._color_collision_shapes(
-                    model,
-                    colliding_shapes,
-                    visualize_graph=False,
-                    shape_labels=model.shape_label,
-                )
+            # Newton-generated contacts do not use MuJoCo's automatic masks.
+            # Keep them disabled if no exact automatic representation exists.
 
         selected_shapes_set = set(selected_shapes)
         mujoco_attrs = getattr(model, "mujoco", None)
@@ -6564,14 +6536,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 elif shape_collision_group[shape] == 0:
                     geom_params["contype"] = 0
                     geom_params["conaffinity"] = 0
-                elif compiled_collision_type is not None and compiled_collision_affinity is not None:
+                else:
                     geom_params["contype"] = mujoco_mask_to_signed(int(compiled_collision_type[shape]))
                     geom_params["conaffinity"] = mujoco_mask_to_signed(int(compiled_collision_affinity[shape]))
-                else:
-                    color = shape_color[shape]
-                    contype, conaffinity = self._collision_color_masks(int(color))
-                    geom_params["contype"] = contype
-                    geom_params["conaffinity"] = conaffinity
 
                 # set friction from Newton shape materials
                 mu = shape_mu[shape]
@@ -6623,7 +6590,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 else:
                     geom_params["margin"] = authored_margin
 
-                body.add_geom(**geom_params)
+                geom_body = body
+                if newton_body_id < 0 and shape in filtered_static_shapes:
+                    # Keep the geom's world transform and Newton identity. Only
+                    # its native contact-filter owner changes; sites stay world-owned.
+                    geom_body = spec.worldbody.add_body(name=f"static_shape_{shape}")
+                    mj_bodies.append(geom_body)
+                    static_shape_bodies[shape] = geom_body
+                geom_body.add_geom(**geom_params)
                 # store the geom name instead of assuming index
                 shape_mapping[shape] = name
 
@@ -7436,7 +7410,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 "The number of geoms in the MuJoCo model does not match the number of colliding shapes in the Newton model."
             )
 
-        if len(spec.bodies) != len(selected_bodies) + 1:  # +1 for the world body
+        if len(spec.bodies) != len(selected_bodies) + len(static_shape_bodies) + 1:
             raise ValueError(
                 "The number of bodies in the MuJoCo model does not match the number of selected bodies in the Newton model. "
                 "Make sure each body belongs to an articulation or has a standalone joint to world."
@@ -7447,6 +7421,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         for b1, b2 in body_filters:
             mb1, mb2 = body_mapping[b1], body_mapping[b2]
             spec.add_exclude(bodyname1=spec.bodies[mb1].name, bodyname2=spec.bodies[mb2].name)
+        for shape, body in static_body_filters:
+            spec.add_exclude(
+                bodyname1=static_shape_bodies[shape].name,
+                bodyname2=mj_bodies[body_mapping[body]].name,
+            )
 
         # add explicit contact pairs from custom attributes
         self._init_pairs(model, spec, shape_mapping, first_world)
