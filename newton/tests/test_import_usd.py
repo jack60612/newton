@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import builtins
+import contextlib
 import hashlib
 import inspect
 import logging
@@ -8534,89 +8535,423 @@ def Xform "Articulation" (
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
         expected_world_anchor = np.array([1.25, 2.5, 3.75])
-        for world_endpoint in (False, True):
+        for endpoint_kind in ("world", "massless", "collider"):
+            world_endpoint = endpoint_kind == "world"
             for reverse in (False, True):
-                with self.subTest(world_endpoint=world_endpoint, reverse=reverse):
+                for native_only in (False, True):
+                    with self.subTest(endpoint_kind=endpoint_kind, reverse=reverse, native_only=native_only):
+                        stage = Usd.Stage.CreateInMemory()
+                        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                        UsdPhysics.Scene.Define(stage, "/physicsScene")
+                        dynamic = UsdGeom.Xform.Define(stage, "/World/Dynamic")
+                        dynamic.AddTranslateOp().Set(Gf.Vec3d(-2.0, 1.0, 0.5))
+                        dynamic.AddRotateYOp().Set(90.0)
+                        UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
+                        mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
+                        mass.CreateMassAttr(1.0)
+                        mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
+                        mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+
+                        # A standalone world-fixed body is not visited by FK.
+                        # Its translated and rotated frame must remain intact.
+                        static = None
+                        if not world_endpoint:
+                            static = UsdGeom.Xform.Define(stage, "/World/Static")
+                            static.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+                            static.AddRotateZOp().Set(90.0)
+                            UsdPhysics.RigidBodyAPI.Apply(static.GetPrim())
+                            if endpoint_kind == "collider":
+                                # Exported static hardware can omit MassAPI and
+                                # density, giving it positive inferred mass.
+                                capsule = UsdGeom.Capsule.Define(stage, "/World/Static/Capsule")
+                                capsule.CreateRadiusAttr(0.01)
+                                capsule.CreateHeightAttr(0.5)
+                                UsdPhysics.CollisionAPI.Apply(capsule.GetPrim())
+                            fixed = UsdPhysics.FixedJoint.Define(stage, "/World/StaticRoot")
+                            fixed.CreateBody1Rel().SetTargets([static.GetPath()])
+                            fixed.CreateLocalPos0Attr(Gf.Vec3f(1.0, 2.0, 3.0))
+                            sqrt_half = math.sqrt(0.5)
+                            fixed.CreateLocalRot0Attr(Gf.Quatf(sqrt_half, 0.0, 0.0, sqrt_half))
+                            fixed.CreateExcludeFromArticulationAttr(True)
+                        endpoints = [dynamic, static]
+                        if reverse:
+                            endpoints.reverse()
+                        connect = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+                        cache = UsdGeom.XformCache()
+                        for endpoint, relationship, local_position in zip(
+                            endpoints,
+                            (connect.CreateBody0Rel(), connect.CreateBody1Rel()),
+                            (connect.CreateLocalPos0Attr(), connect.CreateLocalPos1Attr()),
+                            strict=True,
+                        ):
+                            point = Gf.Vec3d(*expected_world_anchor)
+                            if endpoint is not None:
+                                point = cache.GetLocalToWorldTransform(endpoint.GetPrim()).GetInverse().Transform(point)
+                                if endpoint_kind == "collider":
+                                    site = UsdGeom.Xform.Define(stage, f"{endpoint.GetPath()}/Site")
+                                    site.AddTranslateOp().Set(point)
+                                    relationship.SetTargets([site.GetPath()])
+                                    point = Gf.Vec3d(0.0)
+                                else:
+                                    relationship.SetTargets([endpoint.GetPath()])
+                            local_position.Set(Gf.Vec3f(*point))
+                        connect.CreateExcludeFromArticulationAttr(True)
+                        connect.GetPrim().SetMetadata(
+                            "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                        )
+
+                        builder = newton.ModelBuilder()
+                        if native_only:
+                            result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
+                        else:
+                            result = builder.add_usd(stage)
+                        self.assertNotIn("/World/Connect", result["path_joint_map"])
+                        if not world_endpoint:
+                            static_id = result["path_body_map"]["/World/Static"]
+                            if endpoint_kind == "collider":
+                                self.assertGreater(builder.body_mass[static_id], 0.0)
+                            else:
+                                self.assertEqual(builder.body_mass[static_id], 0.0)
+                            root_id = result["path_joint_map"]["/World/StaticRoot"]
+                            self.assertEqual(builder.joint_child[root_id], static_id)
+                            self.assertEqual(builder.joint_articulation[root_id], -1)
+                        model = builder.finalize(device="cpu")
+                        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+                        self.assertEqual(
+                            model.mujoco.equality_constraint_target_kind.numpy().tolist(),
+                            [int(MjcEqualityTargetKind.NONE)],
+                        )
+                        solver = SolverMuJoCo(model, use_mujoco_cpu=True, njmax=16, nconmax=0)
+                        # Free roots also reserve inactive kinematic WELD rows.
+                        connect_rows = np.flatnonzero(solver.mj_model.eq_type == mujoco.mjtEq.mjEQ_CONNECT)
+                        self.assertEqual(len(connect_rows), 1)
+                        equality = connect_rows[0]
+                        solver.mj_data.qpos[:] = solver.mj_model.qpos0
+                        mujoco.mj_kinematics(solver.mj_model, solver.mj_data)
+                        # Check both the CPU and Warp arrays, not just the stored
+                        # first anchor imported from USD.
+                        for eq_data in (solver.mj_model.eq_data, solver.mjw_model.eq_data.numpy()[0]):
+                            for body_id, anchor in (
+                                (solver.mj_model.eq_obj1id[equality], eq_data[equality, :3]),
+                                (solver.mj_model.eq_obj2id[equality], eq_data[equality, 3:6]),
+                            ):
+                                rotation = solver.mj_data.xmat[body_id].reshape(3, 3)
+                                world_anchor = rotation @ anchor + solver.mj_data.xpos[body_id]
+                                np.testing.assert_allclose(world_anchor, expected_world_anchor, atol=2.0e-6, rtol=0.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_equality_connect_static_xform_reference_anchors(self):
+        """Static targets retain composed affine frames and import transforms."""
+        import mujoco
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        incoming = wp.transform(wp.vec3(0.5, 0.7, -0.2), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5))
+        for site_target in (False, True):
+            for reverse in (False, True):
+                for meters_per_unit in (1.0, 0.01):
+                    with self.subTest(site=site_target, reverse=reverse, meters_per_unit=meters_per_unit):
+                        source = Usd.Stage.CreateInMemory()
+                        asset = UsdGeom.Xform.Define(source, "/Asset")
+                        source.SetDefaultPrim(asset.GetPrim())
+                        UsdPhysics.Scene.Define(source, "/Asset/Scene")
+                        dynamic = UsdGeom.Xform.Define(source, "/Asset/Dynamic")
+                        dynamic.AddTranslateOp().Set(Gf.Vec3d(-1.0, 0.0, 0.5))
+                        UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
+                        mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
+                        mass.CreateMassAttr(1.0)
+                        mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
+                        mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+                        static = UsdGeom.Xform.Define(source, "/Asset/Static")
+                        static.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+                        static.AddRotateYOp().Set(90.0)
+                        static.AddScaleOp().Set(Gf.Vec3f(0.5, 1.5, 2.0))
+                        target_path = "/Asset/Static"
+                        if site_target:
+                            site = UsdGeom.Xform.Define(source, "/Asset/Static/Site")
+                            site.AddTranslateOp().Set(Gf.Vec3d(0.2, 0.3, 0.4))
+                            site.AddRotateZOp().Set(30.0)
+                            target_path = str(site.GetPath())
+                        connect = UsdPhysics.SphericalJoint.Define(source, "/Asset/Connect")
+                        endpoints = ["/Asset/Dynamic", target_path]
+                        if reverse:
+                            endpoints.reverse()
+                        connect.CreateBody0Rel().SetTargets([endpoints[0]])
+                        connect.CreateBody1Rel().SetTargets([endpoints[1]])
+                        connect.CreateExcludeFromArticulationAttr(True)
+                        connect.GetPrim().SetMetadata(
+                            "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                        )
+
+                        stage = Usd.Stage.CreateInMemory()
+                        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                        UsdGeom.SetStageMetersPerUnit(stage, meters_per_unit)
+                        placed = UsdGeom.Xform.Define(stage, "/Placed")
+                        placed.GetPrim().GetReferences().AddReference(source.GetRootLayer().identifier)
+                        placed.AddTranslateOp().Set(Gf.Vec3d(4.0, -3.0, 1.0))
+                        placed.AddRotateZOp().Set(90.0)
+                        placed.AddScaleOp().Set(Gf.Vec3f(2.0))
+                        cache = UsdGeom.XformCache()
+                        target = stage.GetPrimAtPath(target_path.replace("/Asset", "/Placed", 1))
+                        local_static = Gf.Vec3d(0.2, -0.1, 0.3)
+                        stage_point = cache.GetLocalToWorldTransform(target).Transform(local_static)
+                        dynamic_prim = stage.GetPrimAtPath("/Placed/Dynamic")
+                        local_dynamic = cache.GetLocalToWorldTransform(dynamic_prim).GetInverse().Transform(stage_point)
+                        joint = UsdPhysics.Joint(stage.GetPrimAtPath("/Placed/Connect"))
+                        local_positions = [local_dynamic, local_static]
+                        if reverse:
+                            local_positions.reverse()
+                        joint.CreateLocalPos0Attr(Gf.Vec3f(*local_positions[0]))
+                        joint.CreateLocalPos1Attr(Gf.Vec3f(*local_positions[1]))
+                        expected = np.array(wp.transform_point(incoming, wp.vec3(*stage_point)))
+                        builder = newton.ModelBuilder()
+                        # Legacy rigid import warns for non-SI stage metadata;
+                        # it does not silently rescale rigid coordinates.
+                        unit_context = (
+                            self.assertWarnsRegex(UserWarning, "non-unit linear units are not supported")
+                            if meters_per_unit != 1.0
+                            else contextlib.nullcontext()
+                        )
+                        with unit_context:
+                            result = builder.add_usd(stage, root_path="/Placed", xform=incoming)
+                        self.assertNotIn("/Placed/Static", result["path_body_map"])
+                        self.assertNotIn("/Placed/Connect", result["path_joint_map"])
+                        model = builder.finalize(device="cpu")
+                        body0 = model.mujoco.equality_constraint_body1.numpy()[0]
+                        body1 = model.mujoco.equality_constraint_body2.numpy()[0]
+                        self.assertEqual(body0 if reverse else body1, -1)
+                        solver = SolverMuJoCo(model, use_mujoco_cpu=True, njmax=16, nconmax=0)
+                        solver.mj_data.qpos[:] = solver.mj_model.qpos0
+                        mujoco.mj_kinematics(solver.mj_model, solver.mj_data)
+                        for data in (solver.mj_model.eq_data, solver.mjw_model.eq_data.numpy()[0]):
+                            for body, local in (
+                                (solver.mj_model.eq_obj1id[0], data[0, :3]),
+                                (solver.mj_model.eq_obj2id[0], data[0, 3:6]),
+                            ):
+                                world = solver.mj_data.xmat[body].reshape(3, 3) @ local + solver.mj_data.xpos[body]
+                                np.testing.assert_allclose(world, expected, atol=4.0e-6, rtol=0.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_equality_connect_rejects_unresolved_static_targets(self):
+        """Missing/non-xform/filtered rigid targets must not become world."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        for target in ("/World/Missing", "/World/Scope", "/World/Joint", "/World/Ignored/Site"):
+            with self.subTest(target=target):
+                stage = Usd.Stage.CreateInMemory()
+                UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                UsdPhysics.Scene.Define(stage, "/World/Scene")
+                dynamic = UsdGeom.Xform.Define(stage, "/World/Dynamic")
+                UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
+                mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
+                mass.CreateMassAttr(1.0)
+                mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
+                mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+                UsdGeom.Scope.Define(stage, "/World/Scope")
+                UsdPhysics.SphericalJoint.Define(stage, "/World/Joint")
+                ignored = UsdGeom.Xform.Define(stage, "/World/Ignored")
+                UsdPhysics.RigidBodyAPI.Apply(ignored.GetPrim())
+                UsdGeom.Xform.Define(stage, "/World/Ignored/Site")
+                connect = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+                connect.CreateBody0Rel().SetTargets([dynamic.GetPath()])
+                connect.CreateBody1Rel().SetTargets([target])
+                connect.CreateExcludeFromArticulationAttr(True)
+                connect.GetPrim().SetMetadata(
+                    "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                )
+                builder = newton.ModelBuilder()
+                with self.assertWarnsRegex(UserWarning, "references unresolved body target"):
+                    builder.add_usd(stage, ignore_paths=["/World/Ignored"])
+                model = builder.finalize(device="cpu")
+                self.assertEqual(model.mujoco.equality_constraint_count, 0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_equality_weld_static_xform_matches_native(self):
+        """Static welds retain full endpoint frames, offsets, and native data."""
+        import mujoco
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        incoming = wp.transform(wp.vec3(0.5, -0.3, 0.2), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.4))
+
+        def pose_from_matrix(matrix):
+            rotation = matrix.RemoveScaleShear().ExtractRotationQuat()
+            return incoming * wp.transform(
+                wp.vec3(*matrix.ExtractTranslation()),
+                wp.quat(*rotation.GetImaginary(), rotation.GetReal()),
+            )
+
+        def numbers(values):
+            return " ".join(str(float(value)) for value in values)
+
+        for site_target in (False, True):
+            for reverse in (False, True):
+                for convert in (False, True):
+                    with self.subTest(site=site_target, reverse=reverse, convert=convert):
+                        source = Usd.Stage.CreateInMemory()
+                        asset = UsdGeom.Xform.Define(source, "/Asset")
+                        source.SetDefaultPrim(asset.GetPrim())
+                        UsdPhysics.Scene.Define(source, "/Asset/Scene")
+                        dynamic = UsdGeom.Xform.Define(source, "/Asset/Dynamic")
+                        dynamic.AddTranslateOp().Set(Gf.Vec3d(-1.0, 0.0, 0.5))
+                        dynamic.AddRotateXOp().Set(20.0)
+                        UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
+                        mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
+                        mass.CreateMassAttr(1.0)
+                        mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
+                        mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+                        static = UsdGeom.Xform.Define(source, "/Asset/Static")
+                        static.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+                        static.AddRotateYOp().Set(65.0)
+                        static.AddScaleOp().Set(Gf.Vec3f(2.0, 1.0, 1.0))
+                        target = static
+                        if site_target:
+                            target = UsdGeom.Xform.Define(source, "/Asset/Static/Site")
+                            target.AddTranslateOp().Set(Gf.Vec3d(0.2, 0.3, 0.4))
+                            target.AddRotateZOp().Set(30.0)
+                            target.GetPrim().SetMetadata(
+                                "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcSiteAPI"])
+                            )
+                        endpoints = [dynamic, target]
+                        local_positions = [Gf.Vec3d(0.2, -0.4, 0.1), Gf.Vec3d(0.3, 0.2, -0.1)]
+                        local_rotations = [
+                            Gf.Rotation(Gf.Vec3d(1, 0, 0), 25.0),
+                            Gf.Rotation(Gf.Vec3d(0, 1, 0), 45.0),
+                        ]
+                        if reverse:
+                            endpoints.reverse()
+                            local_positions.reverse()
+                            local_rotations.reverse()
+                        weld = UsdPhysics.FixedJoint.Define(source, "/Asset/Weld")
+                        weld.CreateBody0Rel().SetTargets([endpoints[0].GetPath()])
+                        weld.CreateBody1Rel().SetTargets([endpoints[1].GetPath()])
+                        weld.CreateLocalPos0Attr(Gf.Vec3f(*local_positions[0]))
+                        weld.CreateLocalPos1Attr(Gf.Vec3f(*local_positions[1]))
+                        for attribute, rotation in zip(
+                            (weld.CreateLocalRot0Attr(), weld.CreateLocalRot1Attr()), local_rotations, strict=True
+                        ):
+                            quaternion = rotation.GetQuat()
+                            attribute.Set(Gf.Quatf(quaternion.GetReal(), Gf.Vec3f(*quaternion.GetImaginary())))
+                        weld.CreateExcludeFromArticulationAttr(True)
+                        weld.GetPrim().SetMetadata(
+                            "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityWeldAPI"])
+                        )
+                        weld.GetPrim().CreateAttribute("mjc:torqueScale", Sdf.ValueTypeNames.Float).Set(2.5)
+                        stage = Usd.Stage.CreateInMemory()
+                        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                        placed = UsdGeom.Xform.Define(stage, "/Placed")
+                        placed.GetPrim().GetReferences().AddReference(source.GetRootLayer().identifier)
+                        placed.AddTranslateOp().Set(Gf.Vec3d(4.0, -2.0, 1.0))
+                        placed.AddRotateXOp().Set(37.0)
+                        placed.AddScaleOp().Set(Gf.Vec3f(2.0))
+                        cache = UsdGeom.XformCache()
+                        dynamic_pose = pose_from_matrix(
+                            cache.GetLocalToWorldTransform(stage.GetPrimAtPath("/Placed/Dynamic"))
+                        )
+                        frames = []
+                        for endpoint, position, rotation in zip(
+                            endpoints, local_positions, local_rotations, strict=True
+                        ):
+                            local = Gf.Transform()
+                            local.SetTranslation(position)
+                            local.SetRotation(rotation)
+                            prim = stage.GetPrimAtPath(str(endpoint.GetPath()).replace("/Asset", "/Placed", 1))
+                            world_pose = pose_from_matrix(local.GetMatrix() * cache.GetLocalToWorldTransform(prim))
+                            frames.append(
+                                wp.transform_inverse(dynamic_pose) * world_pose if endpoint == dynamic else world_pose
+                            )
+                        relative = frames[0] * wp.transform_inverse(frames[1])
+                        anchor = frames[1].p
+                        names = ["dynamic" if endpoint == dynamic else "world" for endpoint in endpoints]
+                        native = mujoco.MjModel.from_xml_string(
+                            f'<mujoco><worldbody><body name="dynamic" pos="{numbers(dynamic_pose.p)}" '
+                            f'quat="{numbers([dynamic_pose.q[3], *dynamic_pose.q[:3]])}"><freejoint/>'
+                            '<inertial pos="0 0 0" mass="1" diaginertia="0.1 0.1 0.1"/>'
+                            "</body></worldbody><equality>"
+                            f'<weld body1="{names[0]}" body2="{names[1]}" anchor="{numbers(anchor)}" '
+                            f'relpose="{numbers([*relative.p, relative.q[3], *relative.q[:3]])}" torquescale="2.5"/>'
+                            "</equality></mujoco>"
+                        )
+                        builder = newton.ModelBuilder()
+                        result = builder.add_usd(
+                            stage, root_path="/Placed", xform=incoming, convert_mjc_equality_constraints=convert
+                        )
+                        self.assertNotIn("/Placed/Weld", result["path_joint_map"])
+                        model = builder.finalize(device="cpu")
+                        self.assertEqual(model.mujoco.equality_constraint_count, 1)
+                        self.assertEqual(model.mujoco.equality_constraint_target_kind.numpy().tolist(), [0])
+                        solver = SolverMuJoCo(model, use_mujoco_cpu=True, njmax=16, nconmax=0)
+                        for table in (solver.mj_model.eq_data, solver.mjw_model.eq_data.numpy()[0]):
+                            np.testing.assert_allclose(table[0, :6], native.eq_data[0, :6], atol=4.0e-6, rtol=0.0)
+                            self.assertAlmostEqual(abs(np.dot(table[0, 6:10], native.eq_data[0, 6:10])), 1.0, places=5)
+                            self.assertEqual(table[0, 10], 2.5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_static_sites_without_visuals(self):
+        """World sites retain placement independently of visual-loading flags."""
+        import mujoco
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        incoming = wp.transform(wp.vec3(0.5, 0.7, -0.2), wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), 0.5))
+        for load_visuals in (False, True):
+            for load_static_visuals in (False, True):
+                with self.subTest(visuals=load_visuals, static_visuals=load_static_visuals):
                     stage = Usd.Stage.CreateInMemory()
                     UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
                     UsdGeom.SetStageMetersPerUnit(stage, 1.0)
-                    UsdPhysics.Scene.Define(stage, "/physicsScene")
+                    UsdPhysics.Scene.Define(stage, "/World/Scene")
+                    root = UsdGeom.Xform.Define(stage, "/World")
+                    root.AddTranslateOp().Set(Gf.Vec3d(4.0, -2.0, 1.0))
+                    root.AddRotateXOp().Set(37.0)
                     dynamic = UsdGeom.Xform.Define(stage, "/World/Dynamic")
-                    dynamic.AddTranslateOp().Set(Gf.Vec3d(-2.0, 1.0, 0.5))
-                    dynamic.AddRotateYOp().Set(90.0)
                     UsdPhysics.RigidBodyAPI.Apply(dynamic.GetPrim())
                     mass = UsdPhysics.MassAPI.Apply(dynamic.GetPrim())
                     mass.CreateMassAttr(1.0)
                     mass.CreateCenterOfMassAttr(Gf.Vec3f(0.0))
                     mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
-
-                    # A standalone world-fixed body is not visited by FK.
-                    # Its translated and rotated frame must remain intact.
-                    static = None
-                    if not world_endpoint:
-                        static = UsdGeom.Xform.Define(stage, "/World/Static")
-                        static.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
-                        static.AddRotateZOp().Set(90.0)
-                        UsdPhysics.RigidBodyAPI.Apply(static.GetPrim())
-                        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/StaticRoot")
-                        fixed.CreateBody1Rel().SetTargets([static.GetPath()])
-                        fixed.CreateLocalPos0Attr(Gf.Vec3f(1.0, 2.0, 3.0))
-                        sqrt_half = math.sqrt(0.5)
-                        fixed.CreateLocalRot0Attr(Gf.Quatf(sqrt_half, 0.0, 0.0, sqrt_half))
-                        fixed.CreateExcludeFromArticulationAttr(True)
-                    endpoints = [dynamic, static]
-                    if reverse:
-                        endpoints.reverse()
-                    connect = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+                    frame = UsdGeom.Xform.Define(stage, "/World/Static")
+                    frame.AddTranslateOp().Set(Gf.Vec3d(1.0, 2.0, 3.0))
+                    frame.AddRotateZOp().Set(90.0)
+                    frame.AddScaleOp().Set(Gf.Vec3f(2.0))
+                    for path in ("/World/Dynamic/Target", "/World/Static/Reference"):
+                        site = UsdGeom.Sphere.Define(stage, path)
+                        site.CreateRadiusAttr(0.005)
+                        site.AddTranslateOp().Set(Gf.Vec3d(0.1, 0.2, 0.3))
+                        site.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcSiteAPI"]))
+                    UsdGeom.Sphere.Define(stage, "/World/Static/Visual").CreateRadiusAttr(0.01)
                     cache = UsdGeom.XformCache()
-                    for endpoint, relationship, local_position in zip(
-                        endpoints,
-                        (connect.CreateBody0Rel(), connect.CreateBody1Rel()),
-                        (connect.CreateLocalPos0Attr(), connect.CreateLocalPos1Attr()),
-                        strict=True,
-                    ):
-                        point = Gf.Vec3d(*expected_world_anchor)
-                        if endpoint is not None:
-                            relationship.SetTargets([endpoint.GetPath()])
-                            point = cache.GetLocalToWorldTransform(endpoint.GetPrim()).GetInverse().Transform(point)
-                        local_position.Set(Gf.Vec3f(*point))
-                    connect.CreateExcludeFromArticulationAttr(True)
-                    connect.GetPrim().SetMetadata(
-                        "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                    position = cache.GetLocalToWorldTransform(stage.GetPrimAtPath("/World/Static/Reference")).Transform(
+                        Gf.Vec3d(0.0)
                     )
-
+                    expected = np.array(wp.transform_point(incoming, wp.vec3(*position)))
                     builder = newton.ModelBuilder()
                     SolverMuJoCo.register_custom_attributes(builder)
-                    result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
-                    if not world_endpoint:
-                        static_id = result["path_body_map"]["/World/Static"]
-                        self.assertEqual(builder.body_mass[static_id], 0.0)
-                        root_id = result["path_joint_map"]["/World/StaticRoot"]
-                        self.assertEqual(builder.joint_child[root_id], static_id)
-                        self.assertEqual(builder.joint_articulation[root_id], -1)
+                    result = builder.add_usd(
+                        stage,
+                        xform=incoming,
+                        load_sites=True,
+                        load_visual_shapes=load_visuals,
+                        load_static_visual_shapes=load_static_visuals,
+                        schema_resolvers=[usd.SchemaResolverMjc()],
+                    )
+                    reference = result["path_shape_map"]["/World/Static/Reference"]
+                    self.assertEqual(builder.shape_body[reference], -1)
+                    self.assertEqual(builder.shape_label.count("/World/Static/Reference"), 1)
+                    self.assertEqual(builder.shape_label.count("/World/Dynamic/Target"), 1)
+                    self.assertEqual(
+                        "/World/Static/Visual" in result["path_shape_map"], load_visuals and load_static_visuals
+                    )
                     model = builder.finalize(device="cpu")
-                    solver = SolverMuJoCo(model, use_mujoco_cpu=True, njmax=16, nconmax=0)
-                    if not world_endpoint:
-                        ref_q = SolverMuJoCo._build_ref_q(model)
-                        ref_body_q = wp.zeros(model.body_count, dtype=wp.transform, device=model.device)
-                        SolverMuJoCo._compute_body_poses_at_qref(model, ref_q, ref_body_q=ref_body_q)
-                        np.testing.assert_array_equal(ref_body_q.numpy()[static_id], model.body_q.numpy()[static_id])
-                    # Free roots also reserve inactive kinematic WELD rows.
-                    connect_rows = np.flatnonzero(solver.mj_model.eq_type == mujoco.mjtEq.mjEQ_CONNECT)
-                    self.assertEqual(len(connect_rows), 1)
-                    equality = connect_rows[0]
+                    solver = SolverMuJoCo(model, use_mujoco_cpu=True, include_sites=True, njmax=16, nconmax=0)
+                    self.assertEqual(solver.mj_model.nu, 0)
+                    self.assertEqual(solver.mj_model.nsite, 2)
+                    world_sites = np.flatnonzero(solver.mj_model.site_bodyid == 0)
+                    self.assertEqual(len(world_sites), 1)
+                    reference_id = world_sites[0]
                     solver.mj_data.qpos[:] = solver.mj_model.qpos0
                     mujoco.mj_kinematics(solver.mj_model, solver.mj_data)
-                    # Check both the CPU and Warp arrays, not just the stored
-                    # first anchor imported from USD.
-                    for eq_data in (solver.mj_model.eq_data, solver.mjw_model.eq_data.numpy()[0]):
-                        for body_id, anchor in (
-                            (solver.mj_model.eq_obj1id[equality], eq_data[equality, :3]),
-                            (solver.mj_model.eq_obj2id[equality], eq_data[equality, 3:6]),
-                        ):
-                            rotation = solver.mj_data.xmat[body_id].reshape(3, 3)
-                            world_anchor = rotation @ anchor + solver.mj_data.xpos[body_id]
-                            np.testing.assert_allclose(world_anchor, expected_world_anchor, atol=2.0e-6, rtol=0.0)
+                    np.testing.assert_allclose(solver.mj_data.site_xpos[reference_id], expected, atol=3.0e-6, rtol=0.0)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_equality_connect_site_parsing(self):
@@ -8998,7 +9333,7 @@ def Xform "Articulation" (
         converted_builder = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(converted_builder)
         with self.assertWarnsRegex(UserWarning, "higher-order polycoef"):
-            converted_builder.add_usd(build_stage(), only_load_enabled_joints=False)
+            converted_result = converted_builder.add_usd(build_stage(), only_load_enabled_joints=False)
         converted_model = converted_builder.finalize()
         converted_solver = SolverMuJoCo(converted_model)
 
@@ -9009,7 +9344,10 @@ def Xform "Articulation" (
         self.assertEqual(eq_types.tolist().count(int(newton.solvers.SolverMuJoCo.EqType.CONNECT)), 1)
         self.assertEqual(eq_types.tolist().count(int(newton.solvers.SolverMuJoCo.EqType.WELD)), 1)
         self.assertEqual(eq_types.tolist().count(int(newton.solvers.SolverMuJoCo.EqType.JOINT)), 1)
-        self.assertEqual(target_kinds.tolist().count(int(MjcEqualityTargetKind.JOINT)), 2)
+        self.assertEqual(target_kinds.tolist().count(int(MjcEqualityTargetKind.JOINT)), 1)
+        self.assertEqual(target_kinds.tolist().count(int(MjcEqualityTargetKind.NONE)), 1)
+        self.assertIn("/World/Articulation/EqualityConnect", converted_result["path_joint_map"])
+        self.assertNotIn("/World/Articulation/EqualityWeld", converted_result["path_joint_map"])
         self.assertEqual(target_kinds.tolist().count(int(MjcEqualityTargetKind.MIMIC)), 1)
         joint_eq = int(np.flatnonzero(eq_types == int(newton.solvers.SolverMuJoCo.EqType.JOINT))[0])
         self.assertEqual(target_kinds[joint_eq], int(MjcEqualityTargetKind.MIMIC))

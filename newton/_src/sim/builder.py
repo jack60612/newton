@@ -4864,6 +4864,7 @@ class ModelBuilder:
             load_static_visual_shapes: If True, supported visual-only geometry outside
                 rigid-body hierarchies is loaded as static shapes when
                 ``load_visual_shapes`` is also True. Default is True.
+                Static sites are controlled independently by ``load_sites``.
             hide_collision_shapes: If True, collision shapes on bodies that already
                 have visual-only geometry are hidden unconditionally, regardless of
                 whether the collider has authored PBR material data. Default is False.
@@ -4876,6 +4877,11 @@ class ModelBuilder:
                 joints or mimic constraints while preserving MuJoCo equality metadata for SolverMuJoCo. If False,
                 equality constraints are preserved in the ``mujoco:equality_constraint`` custom-attribute namespace
                 and finalize under ``model.mujoco.equality_constraint_*``.
+                CONNECT/WELD constraints with world, standalone zero-mass, or standalone world-fixed endpoints
+                remain native equalities even when True; they do not create Newton loop joints.
+                Bodies owned by an articulation are not treated as standalone static endpoints.
+                Static Xformable/site targets without rigid-body ancestors resolve to world using
+                their composed affine frame and the incoming import transform.
             mesh_maxhullvert: Maximum vertices for convex hull approximation of meshes. Note that an authored ``newton:maxHullVertices`` attribute on any shape with a ``NewtonMeshCollisionAPI`` will take priority over this value.
             schema_resolvers: Resolver instances in priority order. Default is to only parse Newton-specific attributes.
                 Schema resolvers collect per-prim "solver-specific" attributes, see :ref:`schema_resolvers` for more information.
