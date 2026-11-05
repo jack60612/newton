@@ -97,7 +97,7 @@ class ModelConstantsRefresh:
         with wp.ScopedDevice(self.solver.device), self.solver._scoped_mujoco_warp_execution():
             self.condition.zero_()
             wp.launch(_any_world, self.nworld, inputs=[world_mask, self.condition], device=self.solver.device)
-            if self.solver.device.is_cuda and not wp.is_capturing():
+            if self.solver.device.is_cuda and not self.solver.device.is_capturing:
                 self._refresh(world_mask)
             else:
                 wp.capture_if(self.condition, self._refresh, world_mask=world_mask)
