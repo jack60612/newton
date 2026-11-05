@@ -81,6 +81,19 @@ class ModelConstantsRefresh:
         self.workspace = solver._mujoco_warp.Const0Workspace(m, d)
         self.actuator_biasprm = wp.empty_like(m.actuator_biasprm)
         self.physical_meaninertia = wp.empty_like(m.stat.meaninertia)
+        # Host reset notifications replace these arrays. A captured graph keeps
+        # their device addresses, not the solver attribute: retain the immutable
+        # reference inputs for the workspace's entire lifetime.
+        self.connect_reference = (
+            (solver.connect_constraint_q_rel, solver.connect_constraint_t_rel)
+            if solver.has_connect_constraints
+            else None
+        )
+        self.joint_connect_reference = (
+            (solver.jnt_eq_anchor1, solver.jnt_connect_constraint_q_rel, solver.jnt_connect_constraint_t_rel)
+            if solver.has_jnt_connect_constraints
+            else None
+        )
 
     def __call__(self, world_mask: wp.array[wp.bool]) -> None:
         """Refresh selected worlds after live and source numeric-property writes.
@@ -116,19 +129,10 @@ class ModelConstantsRefresh:
         s._launch_solref_from_invweight0()
         # Release does not change reference poses: reuse the reference transforms
         # prepared by ordinary notification, rather than allocate/recompute FK.
-        if s.has_connect_constraints:
-            s._update_connect_constraint_anchors(
-                s.model, m, s.mjc_eq_to_newton_eq, s.connect_constraint_q_rel, s.connect_constraint_t_rel
-            )
-        if s.has_jnt_connect_constraints:
-            s._update_jnt_connect_constraint_anchors(
-                s.model,
-                m,
-                s.mjc_eq_to_newton_jnt,
-                s.jnt_eq_anchor1,
-                s.jnt_connect_constraint_q_rel,
-                s.jnt_connect_constraint_t_rel,
-            )
+        if self.connect_reference is not None:
+            s._update_connect_constraint_anchors(s.model, m, s.mjc_eq_to_newton_eq, *self.connect_reference)
+        if self.joint_connect_reference is not None:
+            s._update_jnt_connect_constraint_anchors(s.model, m, s.mjc_eq_to_newton_jnt, *self.joint_connect_reference)
         for values, saved, width in self.saved:
             if values.size:
                 wp.launch(_restore_unchanged, values.size, inputs=[world_mask, width, saved, values], device=s.device)
