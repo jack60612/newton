@@ -53,6 +53,7 @@ from .collision_masks import (
     compile_newton_collision_graph,
     mujoco_mask_to_signed,
 )
+from .constant_refresh import ModelConstantsRefresh
 from .constants import (
     DEFAULT_LIMIT_SOLREF,
     KINEMATIC_LOCK_INERTIA_RATIO,
@@ -5815,6 +5816,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # Rotated boxes grow into their enclosing AABB, so always start from the compiled ones.
             m.bvh_aabb[adr : adr + num] = np.hstack((aabb[:, :3] @ r.T + offset, aabb[:, 3:] @ np.abs(r).T))
 
+    def prepare_model_constants_refresh(self) -> ModelConstantsRefresh:
+        """Allocate a graphable refresh for fixed-layout numeric release changes.
+
+        Call before graph capture and before retaining views of derived MuJoCo
+        arrays. Write source Newton and live MuJoCo numeric properties, then call
+        the returned workspace with a per-world bool mask before integration.
+        The workspace refreshes the same derived constants, ``dampratio`` biases,
+        joint- and tendon-limit gains, CONNECT anchors and contact cache as host
+        notification, without changing unselected worlds. It publishes the source
+        ``joint_armature`` like an inertial notification. It does not support
+        edits to topology, reference poses, body flags or limit configuration;
+        use ordinary notification for those.
+
+        Requires a MuJoCo Warp build that provides ``Const0Workspace``.
+        """
+        if self.use_mujoco_cpu:
+            raise ValueError("Prepared constants refresh requires the MuJoCo Warp backend")
+        with self._scoped_mujoco_warp_execution():
+            return ModelConstantsRefresh(self)
+
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         if self.use_mujoco_cpu:
@@ -10170,13 +10191,15 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _set_const_0(self, lock_kinematic: bool = True) -> None:
+    def _set_const_0(self, lock_kinematic: bool = True, workspace=None) -> None:
         """Recompute MuJoCo's qpos0-dependent model constants and resolve ``dampratio`` placeholders.
 
         MuJoCo resolves ``dampratio`` only when compiling, so Newton resolves it here from each world's
         physical inertia. With ``lock_kinematic``, kinematic root DOFs are locked with armature of
         ``KINEMATIC_LOCK_INERTIA_RATIO`` times their physical ``dof_M0`` in each world, so weld, contact,
         and limit regularization treat the roots as immovable. Stepping armature stays physical.
+
+        A MuJoCo Warp ``Const0Workspace`` makes the refresh allocation-free for graph capture.
         """
         lock = lock_kinematic and self._kinematic_weld_eq is not None
         # set_const_0's inverse weights include the armature locking kinematic roots, so solve when roots may be locked.
@@ -10189,7 +10212,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if not invweight or actuator not in self._dampratio_invweight_actuators
         ]
         if lock or solve:
-            self._update_physical_qpos0_inertia(lock, solve)
+            self._update_physical_qpos0_inertia(lock, solve, workspace)
         if lock:
             self._update_dof_armature(lock=True)
         if self.use_mujoco_cpu:
@@ -10197,7 +10220,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._mujoco.mj_setConst(self.mj_model, self.mj_data)
         else:
             m = self.mjw_model
-            self._mujoco_warp.set_const_0(m, self.mjw_data)
+            if workspace is None:
+                self._mujoco_warp.set_const_0(m, self.mjw_data)
+            else:
+                self._mujoco_warp.set_const_0(m, self.mjw_data, workspace=workspace)
             if invweight:
                 wp.launch(
                     resolve_actuator_dampratio_invweight_kernel,
@@ -10275,7 +10301,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._dampratio_invweight_dofs = wp.array(dofs[selected], dtype=wp.int32, device=device)
         self._dampratio_invweight_tendons = wp.array(tendons[selected], dtype=wp.int32, device=device)
 
-    def _update_physical_qpos0_inertia(self, lock: bool, dampratio_actuators: list[int]) -> None:
+    def _update_physical_qpos0_inertia(self, lock: bool, dampratio_actuators: list[int], workspace=None) -> None:
         """Evaluate the physical qpos0 inertia for kinematic root locking and ``dampratio`` damping.
 
         On MuJoCo Warp this assembles only the mass matrix, since a second ``set_const_0`` would double every
@@ -10299,7 +10325,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if m.ntendon:
             from mujoco_warp._src.smooth import tendon_armature
 
-            self._mujoco_warp.tendon(m, d)
+            if workspace is None:
+                self._mujoco_warp.tendon(m, d)
+            else:
+                self._mujoco_warp.tendon(m, d, workspace.wrap_geom_xpos)
         self._mujoco_warp.crb(m, d)
         if m.ntendon:
             tendon_armature(m, d)
@@ -10313,7 +10342,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             )
         if dampratio_actuators:
             self._mujoco_warp.factor_m(m, d)
-            self._mujoco_warp.transmission(m, d)
+            if workspace is None:
+                self._mujoco_warp.transmission(m, d)
+            else:
+                self._mujoco_warp.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
             moment, inv_mass_moment = self._dampratio_moment, self._dampratio_inv_mass_moment
             for actuator in dampratio_actuators:
                 wp.launch(
