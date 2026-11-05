@@ -11,6 +11,7 @@ import warp as wp
 
 import newton
 from newton import ModelFlags
+from newton._src.solvers.mujoco.kernels import CTRL_SOURCE_CTRL_DIRECT
 from newton.solvers import SolverMuJoCo
 
 mujoco_warp = pytest.importorskip("mujoco_warp")
@@ -71,6 +72,20 @@ def _zero_first_actuator(mask: wp.array[wp.bool], width: int, values: wp.array[f
 
 
 @wp.kernel
+def _zero_live_release_actuator(
+    mask: wp.array[wp.bool],
+    width: int,
+    ctrl_source: wp.array[int],
+    source_index: wp.array[int],
+    values: wp.array[float],
+):
+    i = wp.tid()
+    actuator = (i % width) // 10
+    if mask[i // width] and ctrl_source[actuator] == CTRL_SOURCE_CTRL_DIRECT and source_index[actuator] == 0:
+        values[i] = 0.0
+
+
+@wp.kernel
 def _zero_bool(mask: wp.array[wp.bool], width: int, values: wp.array[wp.bool]):
     i = wp.tid()
     if mask[i // width]:
@@ -97,7 +112,18 @@ def _make_solver(device, kinematic):
         for world in range(2):
             rotor[world * width + 3 : world * width + 6] = 0.0014435225
         model.joint_armature.assign(rotor)
-        return SolverMuJoCo(model, iterations=2, disable_contacts=False, enable_sleeping=False)
+        # Keep a native implicit PD row alongside the direct site/refsite rows.
+        for array, value in (
+            (model.joint_target_mode, int(newton.JointTargetMode.POSITION)),
+            (model.joint_target_ke, 12.0),
+            (model.joint_target_kd, 2.0),
+        ):
+            values = array.numpy()
+            values[[6, width + 6]] = value
+            array.assign(values)
+        solver = SolverMuJoCo(model, iterations=2, disable_contacts=False, enable_sleeping=False)
+        assert np.any(solver.mjc_actuator_ctrl_source.numpy() == int(SolverMuJoCo.CtrlSource.JOINT_TARGET))
+        return solver
 
 
 def _release(solver, mask):
@@ -124,9 +150,14 @@ def _release(solver, mask):
         (solver.model.mujoco.actuator_gainprm, m.actuator_gainprm),
         (solver.model.mujoco.actuator_biasprm, m.actuator_biasprm),
     ):
-        for array in (source, live):
-            flat = _flat(array)
-            wp.launch(_zero_first_actuator, flat.size, inputs=[mask, flat.size // 2, flat])
+        flat = _flat(source)
+        wp.launch(_zero_first_actuator, flat.size, inputs=[mask, flat.size // 2, flat])
+        flat = _flat(live)
+        wp.launch(
+            _zero_live_release_actuator,
+            flat.size,
+            inputs=[mask, flat.size // 2, solver.mjc_actuator_ctrl_source, solver.mjc_actuator_to_newton_idx, flat],
+        )
     for array in (solver.model.mujoco.equality_constraint_enabled, solver.mjw_data.eq_active):
         flat = array.reshape((array.size,))
         wp.launch(_zero_bool, flat.size, inputs=[mask, flat.size // 2, flat])
