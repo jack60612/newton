@@ -48,6 +48,7 @@ from .collision_masks import (
     compile_newton_collision_graph,
     mujoco_mask_to_signed,
 )
+from .constant_refresh import ModelConstantsRefresh
 from .constants import (
     DEFAULT_LIMIT_SOLREF,
     HINGE_CONNECT_AXIS_OFFSET,
@@ -4848,6 +4849,22 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self.mj_model.body_simple[changed_bodies] = 0
         self.mj_model.dof_simplenum[:] = 0
 
+    def prepare_model_constants_refresh(self) -> ModelConstantsRefresh:
+        """Allocate a graphable refresh for fixed-layout numeric release changes.
+
+        Call before graph capture and before retaining views of derived MuJoCo
+        arrays. Write source Newton and live MuJoCo numeric properties, then call
+        the returned workspace with a per-world bool mask before integration.
+        The workspace refreshes the same derived constants, joint-limit solref,
+        CONNECT anchors and contact cache as host notification, without changing
+        unselected worlds. It does not support edits to topology, reference poses,
+        body flags or limit configuration; use ordinary notification for those.
+        """
+        if self.use_mujoco_cpu:
+            raise ValueError("Prepared constants refresh requires the MuJoCo Warp backend")
+        with self._scoped_mujoco_warp_execution():
+            return ModelConstantsRefresh(self)
+
     @override
     def notify_model_changed(self, flags: ModelFlags | int) -> None:
         if self.use_mujoco_cpu:
@@ -8393,14 +8410,19 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _set_const_0_with_physical_meaninertia(self) -> None:
+    def _set_const_0_with_physical_meaninertia(self, refresh: ModelConstantsRefresh | None = None) -> None:
         """Recompute constants without counting kinematic locking armature in solver statistics."""
-        has_kinematic_bodies = bool(np.any((self.model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0))
+        has_kinematic_bodies = (
+            bool(np.any((self.model.body_flags.numpy() & int(BodyFlags.KINEMATIC)) != 0))
+            if refresh is None
+            else refresh.has_kinematic_bodies
+        )
+        workspace = None if refresh is None else refresh.workspace
         if not has_kinematic_bodies:
             if self.use_mujoco_cpu:
                 self._mujoco.mj_setConst(self.mj_model, self.mj_data)
             else:
-                self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+                self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data, workspace=workspace)
             return
 
         # Subtracting the locking armature in float32 would lose the physical inertia.
@@ -8417,13 +8439,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self._mujoco.mj_setConst(self.mj_model, self.mj_data)
             self.mj_model.stat.meaninertia = physical_meaninertia
         else:
-            actuator_biasprm = wp.clone(self.mjw_model.actuator_biasprm)
-            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
-            physical_meaninertia = wp.clone(self.mjw_model.stat.meaninertia)
+            actuator_biasprm = (
+                wp.clone(self.mjw_model.actuator_biasprm) if refresh is None else refresh.actuator_biasprm
+            )
+            if refresh is not None:
+                wp.copy(actuator_biasprm, self.mjw_model.actuator_biasprm)
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data, workspace=workspace)
+            physical_meaninertia = (
+                wp.clone(self.mjw_model.stat.meaninertia) if refresh is None else refresh.physical_meaninertia
+            )
+            if refresh is not None:
+                wp.copy(physical_meaninertia, self.mjw_model.stat.meaninertia)
 
             self._update_body_properties()
             wp.copy(self.mjw_model.actuator_biasprm, actuator_biasprm)
-            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data)
+            self._mujoco_warp.set_const_0(self.mjw_model, self.mjw_data, workspace=workspace)
             wp.copy(self.mjw_model.stat.meaninertia, physical_meaninertia)
 
     def _update_body_properties(self, apply_kinematic_armature: bool = True):
@@ -9267,6 +9297,17 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             self.mjw_model.jnt_solref.assign(jnt_solref.reshape(1, njnt, 2))
             return
 
+        self._launch_solref_from_invweight0()
+        self.mj_model.jnt_solref[:] = self.mjw_model.jnt_solref.numpy()[0]
+
+    def _launch_solref_from_invweight0(self) -> None:
+        """Launch numeric limit refresh after configuration validation at setup/notification."""
+        njnt = self.mjc_jnt_to_newton_dof.shape[1]
+        if njnt == 0 or self.model.joint_limit_ke is None:
+            return
+        attrs = getattr(self.model, "mujoco", None)
+        joint_limit_solref = getattr(attrs, "solreflimit", None)
+        joint_limit_solref_mode = getattr(attrs, "solreflimit_mode", None)
         nworld = self.mjc_jnt_to_newton_dof.shape[0]
         wp.launch(
             update_jnt_solref_from_invweight0_kernel,
@@ -9284,7 +9325,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             outputs=[self.mjw_model.jnt_solref],
             device=self.model.device,
         )
-        self.mj_model.jnt_solref[:] = self.mjw_model.jnt_solref.numpy()[0]
 
     def _update_pair_properties(self):
         """Update MuJoCo contact pair properties from Newton custom attributes.

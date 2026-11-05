@@ -679,6 +679,33 @@ and :meth:`~newton.solvers.SolverMuJoCo.update_contacts`, using kernels
 from :github:`newton/_src/solvers/mujoco/kernels.py` — see
 `Code pointers`_ for the full anchor list.
 
+Captured numeric-property releases
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+For fixed-layout device-side release, call
+:meth:`~newton.solvers.SolverMuJoCo.prepare_model_constants_refresh` once
+before capture and before retaining views of derived MuJoCo buffers. Setup
+allocates reusable scratch and expands broadcast derived fields per world
+(including ``actuator_biasprm`` and ``dof_armature`` when necessary).
+
+After writing both authoritative Newton properties and live MuJoCo-Warp
+numeric properties, call the returned workspace with a device
+``wp.array[wp.bool]`` of shape ``(nworld,)`` **before integration**. The
+borrowed mask identifies newly changed worlds; the caller clears or overwrites
+it. The refresh recomputes reference inverse weights and related constants,
+repairs CONNECT anchors using unchanged reference transforms, rescales joint
+limit solref, invalidates the contact fast cache and wakes selected worlds.
+Unselected worlds retain their derived values exactly. CUDA capture uses a
+device conditional to skip empty masks; eager CUDA execution computes all
+worlds and commits only selected worlds without condition readback.
+
+This API supports numeric release of armature, damping, passive stiffness,
+equality enable, tendon stiffness/damping and actuator gain/bias. It is not a
+general graphable model editor: topology, reference poses, body flags, limits,
+transmissions and solref configuration must remain fixed. Use ordinary
+``notify_model_changed`` for those edits and for host-side resets. The workspace
+is not reentrant; recreate it if model buffers or topology are replaced.
+
 
 Solver options
 --------------
