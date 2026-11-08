@@ -8200,6 +8200,68 @@ class TestMuJoCoOptions(unittest.TestCase):
             "mjDSBL_MULTICCD should not be set when enable_multiccd=True",
         )
 
+    _CROSSTREE_DAMPER_MJCF = """<mujoco>
+    <option integrator="implicitfast" gravity="0 0 0"/>
+    <worldbody>
+        <body name="a"><joint name="a" type="slide" axis="1 0 0"/><geom size=".1" mass="1"/></body>
+        <body name="b" pos="0 1 0"><joint name="b" type="slide" axis="1 0 0"/><geom size=".1" mass="1"/></body>
+        <body name="c" pos="0 2 0"><joint name="c" type="slide" axis="1 0 0"/><geom size=".1" mass="1"/></body>
+    </worldbody>
+    <tendon>
+        <fixed name="sum"><joint joint="a" coef="1"/><joint joint="b" coef="1"/><joint joint="c" coef="1"/></fixed>
+    </tendon>
+    <actuator>
+        <general name="damper" tendon="sum" biastype="affine" biasprm="0 0 -1000"/>
+    </actuator>
+</mujoco>"""
+
+    def test_implicit_crosstree_iterations_default_and_forwarding(self):
+        """Keep MuJoCo Warp's native implicitfast solve unless cross-tree iterations are requested."""
+        model = self._create_multiworld_model(world_count=1)
+        self.assertEqual(SolverMuJoCo(model).mjw_model.opt.implicit_crosstree_iterations, 0)
+        solver = SolverMuJoCo(model, implicit_crosstree_iterations=2)
+        self.assertEqual(solver.implicit_crosstree_iterations, 2)
+        self.assertEqual(solver.mjw_model.opt.implicit_crosstree_iterations, 2)
+
+    def test_implicit_crosstree_iterations_rejects_invalid_values(self):
+        """Reject invalid counts, the CPU backend, and integrators other than implicitfast."""
+        model = self._create_multiworld_model(world_count=1)
+        for value in (True, 1.5, "2"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "implicit_crosstree_iterations must be an integer"):
+                    SolverMuJoCo(model, implicit_crosstree_iterations=value)
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            SolverMuJoCo(model, implicit_crosstree_iterations=-1)
+        with self.assertRaisesRegex(ValueError, "requires the MuJoCo Warp backend"):
+            SolverMuJoCo(model, use_mujoco_cpu=True, implicit_crosstree_iterations=2)
+        with self.assertRaisesRegex(ValueError, "requires the implicitfast integrator"):
+            SolverMuJoCo(model, integrator="euler", implicit_crosstree_iterations=2)
+
+    def test_implicit_crosstree_iterations_stabilizes_damper_across_articulations(self):
+        """A stiff damper across three articulations diverges natively and decays when enabled."""
+        for iterations in (0, 2):
+            with self.subTest(iterations=iterations):
+                builder = newton.ModelBuilder()
+                builder.add_mjcf(self._CROSSTREE_DAMPER_MJCF, ctrl_direct=True)
+                model = builder.finalize()
+                solver = SolverMuJoCo(
+                    model, integrator="implicitfast", disable_contacts=True, implicit_crosstree_iterations=iterations
+                )
+                state_in, state_out = model.state(), model.state()
+                qd0 = np.array([1.0, -0.5, 0.2], dtype=np.float32)
+                state_in.joint_qd.assign(qd0)
+                control = model.control()
+                for _ in range(100):
+                    solver.step(state_in, state_out, control, None, 0.01)
+                    state_in, state_out = state_out, state_in
+                qd = state_in.joint_qd.numpy()
+                if iterations:
+                    self.assertLess(abs(qd.sum()), 1e-3)
+                    np.testing.assert_allclose(qd - qd.mean(), qd0 - qd0.mean(), atol=1e-4)
+                else:
+                    # the explicit cross-tree damping grows the (1, 1, 1) mode by 1.7x per step
+                    self.assertGreater(np.abs(qd).max(), 100.0)
+
 
 class TestMuJoCoArticulationConversion(unittest.TestCase):
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")

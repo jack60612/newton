@@ -3811,6 +3811,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         include_sites: bool = True,
         skip_visual_only_geoms: bool = True,
         deterministic: wp.DeterministicMode | None = None,
+        implicit_crosstree_iterations: int = 0,
     ):
         """
         Solver options (e.g., ``impratio``) follow this resolution priority:
@@ -3865,6 +3866,12 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             deterministic: Deterministic mode for MuJoCo Warp solver kernels. Pass a
                 :class:`warp.DeterministicMode`, or ``None`` to inherit
                 ``wp.config.deterministic``.
+            implicit_crosstree_iterations: Number of fixed preconditioned conjugate-gradient
+                iterations MuJoCo Warp's ``implicitfast`` integrator spends on actuator and tendon
+                damping between degrees of freedom outside the mass matrix's kinematic-tree
+                sparsity (for example, a damper between two articulations). The native solve
+                treats those couplings explicitly. ``0`` (default) keeps the native solve
+                unchanged. Requires the MuJoCo Warp backend and the ``implicitfast`` integrator.
         """
         super().__init__(model)
 
@@ -3903,6 +3910,21 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             nvmax = int(nvmax)
         if sleep_tolerance is not None and (not math.isfinite(sleep_tolerance) or sleep_tolerance < 0.0):
             raise ValueError(f"sleep_tolerance must be finite and non-negative, got {sleep_tolerance}.")
+        if isinstance(implicit_crosstree_iterations, bool) or not isinstance(
+            implicit_crosstree_iterations, int | np.integer
+        ):
+            raise TypeError(
+                f"implicit_crosstree_iterations must be an integer, got {type(implicit_crosstree_iterations).__name__}."
+            )
+        if implicit_crosstree_iterations < 0:
+            raise ValueError(
+                f"implicit_crosstree_iterations must be non-negative, got {implicit_crosstree_iterations}."
+            )
+        implicit_crosstree_iterations = int(implicit_crosstree_iterations)
+        if implicit_crosstree_iterations and use_mujoco_cpu:
+            raise ValueError("implicit_crosstree_iterations requires the MuJoCo Warp backend (use_mujoco_cpu=False).")
+        self.implicit_crosstree_iterations = implicit_crosstree_iterations
+        """Fixed PCG iterations for implicitfast damping outside the mass-matrix sparsity (0 = native)."""
         self.enable_sleeping = enable_sleeping
         """Whether MuJoCo Warp sleeping is enabled."""
         self.nvmax = nvmax
@@ -4209,6 +4231,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         if self.mjw_model is not None:
             self.mjw_model.opt.run_collision_detection = use_mujoco_contacts
+            if implicit_crosstree_iterations:
+                if int(self.mjw_model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
+                    raise ValueError("implicit_crosstree_iterations requires the implicitfast integrator.")
+                self.mjw_model.opt.implicit_crosstree_iterations = implicit_crosstree_iterations
 
     @contextmanager
     def _scoped_deterministic_config(self):
