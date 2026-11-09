@@ -815,6 +815,80 @@ def test_articulation_view_api(test, device):
     test.assertNotEqual(H2_np[1, 0, 0], 0.0)
 
 
+def test_articulation_view_layout_excludes_unrelated_articulations(test, device):
+    """View-layout J/H hold only the view's articulations, sized by the view, not the model maxima.
+
+    Each world holds a 2-link robot, a larger 5-link plant and free bodies; the model-wide
+    layout sizes every row by the plant and counts every articulation of every world.
+    """
+    world = newton.ModelBuilder()
+
+    def chain(label, links, x):
+        joints, parent = [], -1
+        for i in range(links):
+            body = world.add_link(xform=wp.transform(wp.vec3(x, 0.0, 0.3 * i), wp.quat_identity()), mass=1.0 + i)
+            world.add_shape_box(body=body, hx=0.05, hy=0.05, hz=0.1)
+            joints.append(
+                world.add_joint_revolute(
+                    parent=parent,
+                    child=body,
+                    axis=wp.vec3(0.0, 1.0, 0.0) if i % 2 else wp.vec3(1.0, 0.0, 0.0),
+                    parent_xform=wp.transform(wp.vec3(x, 0.0, 0.0) if parent < 0 else wp.vec3(0.0, 0.0, 0.3)),
+                    child_xform=wp.transform_identity(),
+                )
+            )
+            parent = body
+        world.add_articulation(joints, label=label)
+
+    chain("robot", 2, 0.0)
+    chain("plant", 5, 1.0)
+    for i in range(2):
+        body = world.add_body(xform=wp.transform(wp.vec3(2.0 + i, 0.0, 1.0), wp.quat_identity()), mass=0.5)
+        world.add_shape_sphere(body=body, radius=0.05)
+
+    builder = newton.ModelBuilder()
+    builder.replicate(world, 3)
+    model = builder.finalize(device=device)
+    state = model.state()
+    rng = np.random.default_rng(0)
+    state.joint_q.assign(state.joint_q.numpy() + rng.uniform(-0.5, 0.5, model.joint_coord_count).astype(np.float32))
+    newton.eval_fk(model, state.joint_q, state.joint_qd, state)
+
+    view = newton.selection.ArticulationView(model, pattern="robot")
+    test.assertEqual(view.view_jacobian_shape(), (3, 12, 2))
+    test.assertGreater(model.articulation_count, view.count)
+    test.assertGreater(model.max_dofs_per_articulation, 2)
+
+    J_model = view.eval_jacobian(state).numpy()
+    H_model = view.eval_mass_matrix(state).numpy()
+    J_view = view.eval_jacobian(state, view_layout=True)
+    H_view = view.eval_mass_matrix(state, view_layout=True)
+    test.assertEqual(tuple(J_view.shape), (3, 12, 2))
+    test.assertEqual(tuple(H_view.shape), (3, 2, 2))
+
+    ids = view.articulation_ids.numpy().reshape(-1)
+    np.testing.assert_array_equal(J_view.numpy(), J_model[ids, :12, :2])
+    np.testing.assert_allclose(H_view.numpy(), H_model[ids, :2, :2], rtol=1.0e-6, atol=1.0e-7)
+    # a provided view-layout J takes the J^T M J path instead of the composite rigid body algorithm
+    H_from_J = view.eval_mass_matrix(state, J=J_view, view_layout=True)
+    np.testing.assert_allclose(H_from_J.numpy(), H_model[ids, :2, :2], rtol=1.0e-5, atol=1.0e-6)
+    test.assertNotEqual(np.abs(J_view.numpy()).max(), 0.0)
+
+    # caller-provided buffers are reused; mismatched shapes are rejected
+    J_buf = wp.zeros(view.view_jacobian_shape(), dtype=float, device=device)
+    test.assertIs(view.eval_jacobian(state, J_buf, view_layout=True), J_buf)
+    with test.assertRaises(ValueError):
+        view.eval_jacobian(state, wp.zeros((3, 24, 6), dtype=float, device=device), view_layout=True)
+    with test.assertRaises(ValueError):
+        newton.eval_jacobian(model, state, articulation_ids=view.articulation_ids.reshape((-1,)))
+
+    # a view-local mask still selects articulations
+    mask = wp.array([True, False, True], dtype=bool, device=device)
+    J_masked = view.eval_jacobian(state, mask=mask, view_layout=True).numpy()
+    np.testing.assert_array_equal(J_masked[[0, 2]], J_model[ids[[0, 2]], :12, :2])
+    test.assertEqual(np.abs(J_masked[1]).max(), 0.0)
+
+
 def test_floating_base_jacobian(test, device):
     """Test Jacobian for a floating base articulation (FREE joint at root)."""
     builder = newton.ModelBuilder()
@@ -1168,6 +1242,12 @@ add_function_test(
 )
 add_function_test(TestJacobianMassMatrix, "test_empty_model", test_empty_model, devices=devices)
 add_function_test(TestJacobianMassMatrix, "test_articulation_view_api", test_articulation_view_api, devices=devices)
+add_function_test(
+    TestJacobianMassMatrix,
+    "test_articulation_view_layout_excludes_unrelated_articulations",
+    test_articulation_view_layout_excludes_unrelated_articulations,
+    devices=devices,
+)
 add_function_test(TestJacobianMassMatrix, "test_floating_base_jacobian", test_floating_base_jacobian, devices=devices)
 add_function_test(
     TestJacobianMassMatrix, "test_jacobian_matches_body_qd_com", test_jacobian_matches_body_qd_com, devices=devices

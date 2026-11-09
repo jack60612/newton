@@ -1277,6 +1277,7 @@ def eval_articulation_jacobian(
     articulation_end: wp.array[int],
     articulation_count: int,
     articulation_mask: wp.array[bool],
+    articulation_ids: wp.array[int],
     joint_type: wp.array[int],
     joint_parent: wp.array[int],
     joint_child: wp.array[int],
@@ -1296,9 +1297,13 @@ def eval_articulation_jacobian(
     """Compute spatial Jacobian for articulations.
 
     The Jacobian J maps joint velocities to spatial velocities of each link.
-    Output shape: (articulation_count, max_links*6, max_dofs)
+    Output shape: (articulation_count, max_links*6, max_dofs), or
+    (len(articulation_ids), links*6, dofs) when ``articulation_ids`` selects the rows.
     """
-    art_idx = wp.tid()
+    out_idx = wp.tid()
+    art_idx = out_idx
+    if articulation_ids:
+        art_idx = articulation_ids[out_idx]
 
     if art_idx >= articulation_count:
         return
@@ -1350,7 +1355,7 @@ def eval_articulation_jacobian(
                 S_com = wp.spatial_vector(velocity_at_point(S, x_com_world), wp.spatial_bottom(S))
 
                 for k in range(6):
-                    J[art_idx, row_start + k, col] = S_com[k]
+                    J[out_idx, row_start + k, col] = S_com[k]
 
             j = joint_ancestor[j]
 
@@ -1361,6 +1366,8 @@ def eval_jacobian(
     J: wp.array | None = None,
     joint_S_s: wp.array | None = None,
     mask: wp.array[bool] | None = None,
+    *,
+    articulation_ids: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Evaluate spatial Jacobian for articulations.
 
@@ -1380,12 +1387,23 @@ def eval_jacobian(
         mask: Optional one-dimensional mask of shape (articulation_count,) selecting
               which articulations to compute. If None, computes for all articulations.
               Two-dimensional per-world masks are not supported.
+        articulation_ids: Optional model articulation indices, shape [n]. When given,
+              ``J[i]`` holds articulation ``articulation_ids[i]`` and ``J`` (required) has
+              shape (n, rows, cols) with ``rows >= 6 * joints`` and ``cols >= dofs`` of every
+              listed articulation, instead of the model-wide maxima. ``mask`` still indexes
+              model articulations.
 
     Returns:
         The Jacobian array J, or None if the model has no articulations.
     """
     if model.articulation_count == 0:
         return None
+
+    count = model.articulation_count
+    if articulation_ids is not None:
+        count = articulation_ids.shape[0]
+        if J is None or J.shape[0] != count:
+            raise ValueError(f"articulation_ids requires J with leading dimension {count}")
 
     # Allocate output if not provided
     if J is None:
@@ -1410,12 +1428,13 @@ def eval_jacobian(
 
     wp.launch(
         kernel=eval_articulation_jacobian,
-        dim=model.articulation_count,
+        dim=count,
         inputs=[
             model.articulation_start,
             model.articulation_end,
             model.articulation_count,
             mask,
+            articulation_ids,
             model.joint_type,
             model.joint_parent,
             model.joint_child,
@@ -1509,6 +1528,7 @@ def eval_articulation_mass_matrix(
     articulation_end: wp.array[int],
     articulation_count: int,
     articulation_mask: wp.array[bool],
+    articulation_ids: wp.array[int],
     joint_child: wp.array[int],
     joint_qd_start: wp.array[int],
     body_I_s: wp.array[wp.spatial_matrix],
@@ -1521,9 +1541,13 @@ def eval_articulation_mass_matrix(
 
     The mass matrix H relates joint accelerations to joint forces/torques.
     If ``joint_armature`` is provided, it is added to the diagonal.
-    Output shape: (articulation_count, max_dofs, max_dofs)
+    Output shape: (articulation_count, max_dofs, max_dofs), or (len(articulation_ids), dofs, dofs)
+    when ``articulation_ids`` selects the rows of ``J`` and ``H``.
     """
-    art_idx = wp.tid()
+    out_idx = wp.tid()
+    art_idx = out_idx
+    if articulation_ids:
+        art_idx = articulation_ids[out_idx]
 
     if art_idx >= articulation_count:
         return
@@ -1559,15 +1583,15 @@ def eval_articulation_mass_matrix(
                 # J_i^T * I_i * J_j (for the 6 rows of this link)
                 for k in range(6):
                     for l in range(6):
-                        J_ik = J[art_idx, row_start + k, dof_i]
-                        J_jl = J[art_idx, row_start + l, dof_j]
+                        J_ik = J[out_idx, row_start + k, dof_i]
+                        J_jl = J[out_idx, row_start + l, dof_j]
                         sum_val += J_ik * I_s[k, l] * J_jl
 
-                H[art_idx, dof_i, dof_j] = H[art_idx, dof_i, dof_j] + sum_val
+                H[out_idx, dof_i, dof_j] = H[out_idx, dof_i, dof_j] + sum_val
 
     if joint_armature:
         for dof in range(articulation_dof_count):
-            H[art_idx, dof, dof] = H[art_idx, dof, dof] + joint_armature[articulation_dof_start + dof]
+            H[out_idx, dof, dof] = H[out_idx, dof, dof] + joint_armature[articulation_dof_start + dof]
 
 
 @wp.kernel(enable_backward=False)
@@ -1697,6 +1721,7 @@ def eval_articulation_mass_matrix_crba(
     articulation_start: wp.array[int],
     articulation_end: wp.array[int],
     articulation_mask: wp.array[bool],
+    articulation_ids: wp.array[int],
     joint_child: wp.array[int],
     joint_ancestor: wp.array[int],
     joint_qd_start: wp.array[int],
@@ -1714,9 +1739,13 @@ def eval_articulation_mass_matrix_crba(
     ancestors; entries between different branches stay zero. Motion subspaces
     and composite inertias are both taken about the root body origin. Each
     entry pair is written by one thread: c writes rows of strict ancestors and
-    rows ``r <= c`` of its own joint.
+    rows ``r <= c`` of its own joint. With ``articulation_ids``, output row ``i`` holds
+    articulation ``articulation_ids[i]``.
     """
-    art_idx, col = wp.tid()
+    out_idx, col = wp.tid()
+    art_idx = out_idx
+    if articulation_ids:
+        art_idx = articulation_ids[out_idx]
     if articulation_mask:
         if not articulation_mask[art_idx]:
             return
@@ -1748,8 +1777,8 @@ def eval_articulation_mass_matrix_crba(
                     if dof_r == dof_c:
                         h += joint_armature[dof_c]
                 row = dof_r - articulation_dof_start
-                H[art_idx, row, col] = h
-                H[art_idx, col, row] = h
+                H[out_idx, row, col] = h
+                H[out_idx, col, row] = h
         a = joint_ancestor[a]
 
 
@@ -1983,6 +2012,7 @@ def eval_mass_matrix(
     mask: wp.array[bool] | None = None,
     *,
     include_armature: bool = True,
+    articulation_ids: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Evaluate generalized mass matrix for articulations.
 
@@ -2021,6 +2051,10 @@ def eval_mass_matrix(
               False returns the rigid-body matrix and emits a
               :class:`DeprecationWarning`. This argument will be removed in a
               future minor release.
+        articulation_ids: Optional model articulation indices, shape [n]. When given,
+              ``H[i]`` (and ``J[i]``, if provided) hold articulation ``articulation_ids[i]``;
+              ``H`` (required) and ``J`` have leading dimension n and need only cover the
+              listed articulations (see :func:`eval_jacobian`).
 
     Returns:
         The mass matrix array H, or None if the model has no articulations.
@@ -2040,6 +2074,7 @@ def eval_mass_matrix(
         joint_S_s=joint_S_s,
         mask=mask,
         include_armature=include_armature,
+        articulation_ids=articulation_ids,
     )
 
 
@@ -2054,6 +2089,7 @@ def _eval_mass_matrix(
     *,
     include_armature: bool = True,
     requires_grad: bool | None = None,
+    articulation_ids: wp.array[int] | None = None,
 ) -> wp.array | None:
     """Implement :func:`eval_mass_matrix` without the deprecation warning.
 
@@ -2062,6 +2098,12 @@ def _eval_mass_matrix(
     """
     if model.articulation_count == 0:
         return None
+
+    count = model.articulation_count
+    if articulation_ids is not None:
+        count = articulation_ids.shape[0]
+        if H is None or H.shape[0] != count or (J is not None and J.shape[0] != count):
+            raise ValueError(f"articulation_ids requires H (and J, if given) with leading dimension {count}")
 
     # Allocate output if not provided
     if H is None:
@@ -2153,11 +2195,12 @@ def _eval_mass_matrix(
         )
         wp.launch(
             kernel=eval_articulation_mass_matrix_crba,
-            dim=(model.articulation_count, model.max_dofs_per_articulation),
+            dim=(count, H.shape[2] if articulation_ids is not None else model.max_dofs_per_articulation),
             inputs=[
                 model.articulation_start,
                 model.articulation_end,
                 mask,
+                articulation_ids,
                 model.joint_child,
                 model.joint_ancestor,
                 model.joint_qd_start,
@@ -2189,20 +2232,21 @@ def _eval_mass_matrix(
         max_links = model.max_joints_per_articulation
         max_dofs = model.max_dofs_per_articulation
         J = wp.zeros(
-            (model.articulation_count, max_links * 6, max_dofs),
+            (count, max_links * 6, max_dofs),
             dtype=float,
             device=model.device,
         )
-        eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask)
+        eval_jacobian(model, state, J, joint_S_s=joint_S_s, mask=mask, articulation_ids=articulation_ids)
 
     wp.launch(
         kernel=eval_articulation_mass_matrix,
-        dim=model.articulation_count,
+        dim=count,
         inputs=[
             model.articulation_start,
             model.articulation_end,
             model.articulation_count,
             mask,
+            articulation_ids,
             model.joint_child,
             model.joint_qd_start,
             body_I_s,

@@ -1519,6 +1519,13 @@ class ArticulationView:
 
         # articulation ids grouped by world
         self.articulation_ids = wp.array(articulation_id_grid, dtype=int, device=self.device)
+        self._articulation_ids_flat = self.articulation_ids.reshape((-1,))
+        # Extents of the selected articulations in the eval_jacobian/eval_mass_matrix layout.
+        selected = articulation_id_grid.reshape(-1)
+        selected_start = model_articulation_start[selected]
+        selected_end = model_articulation_end[selected]
+        self._eval_joint_count = int((selected_end - selected_start).max())
+        self._eval_dof_count = int((model_joint_qd_start[selected_end] - model_joint_qd_start[selected_start]).max())
         #: Model world of each view world, or -1 for a view of global articulations.
         self.world_ids: wp.array[int] = wp.array(selected_world_ids, dtype=int, device=self.device)
         #: Whether the view skips model worlds that contain no matching articulation.
@@ -2277,7 +2284,15 @@ class ArticulationView:
         articulation_mask = self.get_model_articulation_mask(mask=mask)
         eval_fk(self.model, target.joint_q, target.joint_qd, target, mask=articulation_mask, joint_mask=joint_mask)
 
-    def eval_jacobian(self, state: State, J=None, joint_S_s=None, mask=None):
+    def view_jacobian_shape(self) -> tuple[int, int, int]:
+        """Shape of :meth:`eval_jacobian` output with ``view_layout=True``: (count, joints*6, dofs).
+
+        ``joints`` and ``dofs`` are the largest joint and DOF counts of the selected articulations
+        (including a fixed root joint), in the same row/column order as the model-wide layout.
+        """
+        return (self.count, 6 * self._eval_joint_count, self._eval_dof_count)
+
+    def eval_jacobian(self, state: State, J=None, joint_S_s=None, mask=None, *, view_layout: bool = False):
         """Evaluate spatial Jacobian for articulations in this view.
 
         Computes the spatial Jacobian J that maps joint velocities to spatial
@@ -2286,19 +2301,45 @@ class ArticulationView:
 
         Args:
             state: The state containing body transforms (body_q).
-            J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs).
-               If None, allocates internally.
+            J: Optional output array for the Jacobian, shape (articulation_count, max_links*6, max_dofs),
+               or :meth:`view_jacobian_shape` with ``view_layout``. If None, allocates internally.
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
+            view_layout: If True, ``J[i]`` holds this view's i-th articulation (world-major order)
+               and is sized by this view's articulations instead of the model-wide maxima over all
+               articulations, so memory does not scale with unrelated articulations in the model.
 
         Returns:
             The Jacobian array J, or None if the model has no articulations.
         """
         articulation_mask = self.get_model_articulation_mask(mask=mask)
-        return eval_jacobian(self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask)
+        if not view_layout:
+            return eval_jacobian(self.model, state, J, joint_S_s=joint_S_s, mask=articulation_mask)
+        shape = self.view_jacobian_shape()
+        if J is None:
+            J = wp.empty(shape, dtype=float, device=self.device)
+        elif tuple(J.shape) != shape:
+            raise ValueError(f"view-layout J has shape {tuple(J.shape)}, expected {shape}")
+        return eval_jacobian(
+            self.model,
+            state,
+            J,
+            joint_S_s=joint_S_s,
+            mask=articulation_mask,
+            articulation_ids=self._articulation_ids_flat,
+        )
 
     def eval_mass_matrix(
-        self, state: State, H=None, J=None, body_I_s=None, joint_S_s=None, mask=None, *, include_armature=True
+        self,
+        state: State,
+        H=None,
+        J=None,
+        body_I_s=None,
+        joint_S_s=None,
+        mask=None,
+        *,
+        include_armature=True,
+        view_layout: bool = False,
     ):
         """Evaluate generalized mass matrix for articulations in this view.
 
@@ -2310,9 +2351,10 @@ class ArticulationView:
 
         Args:
             state: The state containing body transforms (body_q).
-            H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs).
-               If None, allocates internally.
-            J: Optional pre-computed Jacobian. If None, see :func:`~newton.eval_mass_matrix`.
+            H: Optional output array for mass matrix, shape (articulation_count, max_dofs, max_dofs),
+               or (count, dofs, dofs) with ``view_layout``. If None, allocates internally.
+            J: Optional pre-computed Jacobian (same layout as ``H``). If None, see
+               :func:`~newton.eval_mass_matrix`.
             body_I_s: Optional pre-allocated temp array for spatial inertias.
             joint_S_s: Optional pre-allocated temp array for motion subspaces.
             mask: Optional mask of articulations in this ArticulationView (all by default).
@@ -2321,6 +2363,7 @@ class ArticulationView:
                False returns the rigid-body matrix and emits a
                :class:`NewtonDeprecationWarning`. This argument will be removed in a
                future minor release.
+            view_layout: If True, use the per-view layout of :meth:`eval_jacobian` for ``J`` and ``H``.
 
         Returns:
             The mass matrix array H, or None if the model has no articulations.
@@ -2332,6 +2375,16 @@ class ArticulationView:
                 stacklevel=2,
             )
         articulation_mask = self.get_model_articulation_mask(mask=mask)
+        articulation_ids = None
+        if view_layout:
+            shape = (self.count, self._eval_dof_count, self._eval_dof_count)
+            if H is None:
+                H = wp.empty(shape, dtype=float, device=self.device)
+            elif tuple(H.shape) != shape:
+                raise ValueError(f"view-layout H has shape {tuple(H.shape)}, expected {shape}")
+            if J is not None and tuple(J.shape) != self.view_jacobian_shape():
+                raise ValueError(f"view-layout J has shape {tuple(J.shape)}, expected {self.view_jacobian_shape()}")
+            articulation_ids = self._articulation_ids_flat
         return _eval_mass_matrix(
             self.model,
             state,
@@ -2340,6 +2393,7 @@ class ArticulationView:
             body_I_s=body_I_s,
             joint_S_s=joint_S_s,
             mask=articulation_mask,
+            articulation_ids=articulation_ids,
             include_armature=include_armature,
         )
 

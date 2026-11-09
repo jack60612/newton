@@ -287,6 +287,7 @@ class Picking:
                 model.articulation_end[art : art + 1],
                 1,
                 None,
+                None,
                 model.joint_type,
                 model.joint_parent,
                 model.joint_child,
