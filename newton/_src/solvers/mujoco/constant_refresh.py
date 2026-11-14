@@ -90,8 +90,10 @@ class ModelConstantsRefresh:
 
         Supports eager execution and CUDA graph recording/replay. No device
         allocation occurs here. During CUDA capture a conditional node skips
-        all work when the device mask is empty. Eager CUDA execution computes all
-        worlds and commits only selected worlds, avoiding condition readback.
+        all work when the device mask is empty. The MuJoCo Warp inverse-weight
+        solves run for selected worlds only; the cheap per-world notification
+        kernels run for all worlds and unselected worlds are restored. Eager CUDA
+        execution skips the empty-mask check, avoiding condition readback.
         Topology, references, limits, body flags and buffer identities must remain
         unchanged since preparation.
         """
@@ -115,7 +117,7 @@ class ModelConstantsRefresh:
         wp.copy(s._notify_joint_armature, s.model.joint_armature)
         s._update_dof_armature()
         s._update_actuator_properties()
-        s._set_const_0(workspace=self.workspace)
+        s._set_const_0(workspace=self.workspace, world_mask=world_mask)
         s._update_solref_from_invweight0()
         s._update_tendon_limit_gains()
         # Release does not change reference poses: reuse the relative transforms

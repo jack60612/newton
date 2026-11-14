@@ -5860,7 +5860,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         edits to topology, reference poses, body flags or limit configuration;
         use ordinary notification for those.
 
-        Requires a MuJoCo Warp build that provides ``Const0Workspace``.
+        Requires a MuJoCo Warp build that provides ``Const0Workspace`` and a
+        ``world_mask`` argument to ``set_const_0``.
         """
         if self.use_mujoco_cpu:
             raise ValueError("Prepared constants refresh requires the MuJoCo Warp backend")
@@ -10222,7 +10223,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             device=self.model.device,
         )
 
-    def _set_const_0(self, lock_kinematic: bool = True, workspace=None) -> None:
+    def _set_const_0(self, lock_kinematic: bool = True, workspace=None, world_mask: wp.array | None = None) -> None:
         """Recompute MuJoCo's qpos0-dependent model constants and resolve ``dampratio`` placeholders.
 
         MuJoCo resolves ``dampratio`` only when compiling, so Newton resolves it here from each world's
@@ -10230,7 +10231,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ``KINEMATIC_LOCK_INERTIA_RATIO`` times their physical ``dof_M0`` in each world, so weld, contact,
         and limit regularization treat the roots as immovable. Stepping armature stays physical.
 
-        A MuJoCo Warp ``Const0Workspace`` makes the refresh allocation-free for graph capture.
+        A MuJoCo Warp ``Const0Workspace`` makes the refresh allocation-free for graph capture. With
+        ``world_mask``, MuJoCo Warp recomputes the constants of the selected worlds only.
         """
         lock = lock_kinematic and self._kinematic_weld_eq is not None
         # set_const_0's inverse weights include the armature locking kinematic roots, so solve when roots may be locked.
@@ -10254,7 +10256,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             if workspace is None:
                 self._mujoco_warp.set_const_0(m, self.mjw_data)
             else:
-                self._mujoco_warp.set_const_0(m, self.mjw_data, workspace=workspace)
+                self._mujoco_warp.set_const_0(m, self.mjw_data, workspace=workspace, world_mask=world_mask)
             if invweight:
                 wp.launch(
                     resolve_actuator_dampratio_invweight_kernel,

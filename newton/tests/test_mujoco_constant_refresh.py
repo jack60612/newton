@@ -3,6 +3,7 @@
 
 """Numeric release refresh parity with the existing host notification path."""
 
+import inspect
 from unittest import mock
 
 import numpy as np
@@ -16,7 +17,9 @@ from newton.solvers import SolverMuJoCo
 
 mujoco_warp = pytest.importorskip("mujoco_warp")
 pytestmark = pytest.mark.skipif(
-    not hasattr(mujoco_warp, "Const0Workspace"), reason="Requires MuJoCo Warp with Const0Workspace"
+    not hasattr(mujoco_warp, "Const0Workspace")
+    or "world_mask" not in inspect.signature(mujoco_warp.set_const_0).parameters,
+    reason="Requires MuJoCo Warp with Const0Workspace and a world-masked set_const_0",
 )
 
 _MJCF = """
@@ -305,3 +308,14 @@ def test_release_constants_cpu_without_ambient_device_scope():
     refresh(mask)
     for name, value in _derived(solver).items():
         np.testing.assert_array_equal(value, before[name], err_msg=name)
+
+
+def test_release_constants_solve_selected_worlds_only():
+    solver = _make_solver("cpu", False)
+    refresh = solver.prepare_model_constants_refresh()
+    mask = wp.array([False, True], dtype=wp.bool, device="cpu")
+    with mock.patch.object(solver._mujoco_warp, "set_const_0", wraps=solver._mujoco_warp.set_const_0) as set_const_0:
+        refresh(mask)
+    # MuJoCo Warp's inverse-weight solves receive the release mask instead of solving every world.
+    set_const_0.assert_called_once()
+    assert set_const_0.call_args.kwargs["world_mask"] is mask
