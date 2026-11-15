@@ -10322,11 +10322,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 device=self.model.device,
             )
         if dampratio_actuators:
+            self._mujoco_warp.factor_m(m, d)
             if workspace is None:
-                self._mujoco_warp.factor_m(m, d)
                 self._mujoco_warp.transmission(m, d)
             else:
-                self._mujoco_warp.factor_m(m, d, workspace.qLD_scratch)
                 self._mujoco_warp.transmission(m, d, workspace.moment_nnz, workspace.transmission_ncon)
             moment, inv_mass_moment = self._dampratio_moment, self._dampratio_inv_mass_moment
             for actuator in dampratio_actuators:
