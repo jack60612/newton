@@ -47,8 +47,10 @@ try:
     import mujoco_warp
 
     MJWARP_CROSSTREE = "implicit_crosstree_iterations" in getattr(mujoco_warp.Option, "__annotations__", {})
+    MJWARP_SKIP_TREES = "skip_unconstrained_trees" in getattr(mujoco_warp.Option, "__annotations__", {})
 except ImportError:
     MJWARP_CROSSTREE = False
+    MJWARP_SKIP_TREES = False
 
 
 def _add_deprecated_mimic_constraint(
@@ -8910,6 +8912,59 @@ class TestMuJoCoOptions(unittest.TestCase):
                 else:
                     # the explicit cross-tree damping grows the (1, 1, 1) mode by 1.7x per step
                     self.assertGreater(np.abs(qd).max(), 100.0)
+
+    _SKIP_TREES_MJCF = """<mujoco>
+    <worldbody>
+        <geom type="plane" size="5 5 .1"/>
+        <body name="ball" pos="0 0 .099"><freejoint/><geom size=".1" mass="1"/></body>
+        <body name="link0" pos="1 0 2">
+            <joint type="hinge" axis="1 0 0" damping=".1"/><geom type="capsule" fromto="0 0 0 0 .3 0" size=".02"/>
+            <body name="link1" pos="0 .3 0">
+                <joint type="hinge" axis="1 0 0" damping=".1"/><geom type="capsule" fromto="0 0 0 0 .3 0" size=".02"/>
+            </body>
+        </body>
+    </worldbody>
+</mujoco>"""
+
+    @unittest.skipUnless(MJWARP_SKIP_TREES, "Requires MuJoCo Warp with Option.skip_unconstrained_trees")
+    def test_skip_unconstrained_trees_default_and_forwarding(self):
+        """Iterate every degree of freedom unless skipping trees without constraint rows is requested."""
+        model = self._create_multiworld_model(world_count=1)
+        self.assertFalse(SolverMuJoCo(model, solver="cg").mjw_model.opt.skip_unconstrained_trees)
+        solver = SolverMuJoCo(model, solver="cg", skip_unconstrained_trees=True)
+        self.assertTrue(solver.skip_unconstrained_trees)
+        self.assertTrue(solver.mjw_model.opt.skip_unconstrained_trees)
+
+    @unittest.skipUnless(MJWARP_SKIP_TREES, "Requires MuJoCo Warp with Option.skip_unconstrained_trees")
+    def test_skip_unconstrained_trees_rejects_invalid_values(self):
+        """Reject non-bool values, the CPU backend, and solvers other than CG."""
+        model = self._create_multiworld_model(world_count=1)
+        for value in (1, "true", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "skip_unconstrained_trees must be a bool"):
+                    SolverMuJoCo(model, solver="cg", skip_unconstrained_trees=value)
+        with self.assertRaisesRegex(ValueError, "requires the MuJoCo Warp backend"):
+            SolverMuJoCo(model, solver="cg", use_mujoco_cpu=True, skip_unconstrained_trees=True)
+        with self.assertRaisesRegex(ValueError, "requires the CG solver"):
+            SolverMuJoCo(model, solver="newton", skip_unconstrained_trees=True)
+
+    @unittest.skipUnless(MJWARP_SKIP_TREES, "Requires MuJoCo Warp with Option.skip_unconstrained_trees")
+    def test_skip_unconstrained_trees_matches_full_solve(self):
+        """A resting ball (contact rows) and a swinging pendulum (no rows) follow the full CG solve."""
+        q = {}
+        for skip in (False, True):
+            builder = newton.ModelBuilder()
+            builder.add_mjcf(self._SKIP_TREES_MJCF)
+            model = builder.finalize()
+            solver = SolverMuJoCo(model, solver="cg", integrator="implicitfast", skip_unconstrained_trees=skip)
+            state_in, state_out = model.state(), model.state()
+            control = model.control()
+            for _ in range(200):
+                solver.step(state_in, state_out, control, None, 0.002)
+                state_in, state_out = state_out, state_in
+            q[skip] = state_in.joint_q.numpy()
+            self.assertGreater(int(solver.mjw_data.nefc.numpy()[0]), 0)
+        np.testing.assert_allclose(q[True], q[False], atol=1e-4)
 
 
 class TestMuJoCoArticulationConversion(unittest.TestCase):

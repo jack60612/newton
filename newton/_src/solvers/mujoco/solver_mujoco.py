@@ -4465,6 +4465,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         strict_capacity: bool = False,
         kinematic_switchable_roots: bool = True,
         implicit_crosstree_iterations: int = 0,
+        skip_unconstrained_trees: bool = False,
     ):
         """
         Solver options (e.g., ``impratio``) follow this resolution priority:
@@ -4571,6 +4572,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 sparsity (for example, a damper between two articulations). The native solve
                 treats those couplings explicitly. ``0`` (default) keeps the native solve
                 unchanged. Requires the MuJoCo Warp backend and the ``implicitfast`` integrator.
+            skip_unconstrained_trees: If ``True``, MuJoCo Warp's CG solver iterates only the
+                kinematic trees that carry constraint rows, as MuJoCo's per-island solve does.
+                Trees without rows keep ``qacc_smooth`` after one iterative-refinement step and
+                their exact smooth force. ``False`` (default) iterates every degree of freedom.
+                Requires the MuJoCo Warp backend and the CG solver.
         """
         if update_data_interval is not None:
             warnings.warn(_UPDATE_DATA_INTERVAL_DEPRECATION_MSG, NewtonDeprecationWarning, stacklevel=2)
@@ -4630,6 +4636,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             raise ValueError("implicit_crosstree_iterations requires the MuJoCo Warp backend (use_mujoco_cpu=False).")
         self.implicit_crosstree_iterations = implicit_crosstree_iterations
         """Fixed PCG iterations for implicitfast damping outside the mass-matrix sparsity (0 = native)."""
+        if not isinstance(skip_unconstrained_trees, bool | np.bool_):
+            raise TypeError(f"skip_unconstrained_trees must be a bool, got {type(skip_unconstrained_trees).__name__}.")
+        skip_unconstrained_trees = bool(skip_unconstrained_trees)
+        if skip_unconstrained_trees and use_mujoco_cpu:
+            raise ValueError("skip_unconstrained_trees requires the MuJoCo Warp backend (use_mujoco_cpu=False).")
+        self.skip_unconstrained_trees = skip_unconstrained_trees
+        """Whether MuJoCo Warp's CG skips kinematic trees without constraint rows."""
         self.enable_sleeping = enable_sleeping
         """Whether MuJoCo Warp sleeping is enabled."""
         self.nvmax = nvmax
@@ -5014,6 +5027,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 if int(self.mjw_model.opt.integrator) != int(mujoco.mjtIntegrator.mjINT_IMPLICITFAST):
                     raise ValueError("implicit_crosstree_iterations requires the implicitfast integrator.")
                 self.mjw_model.opt.implicit_crosstree_iterations = implicit_crosstree_iterations
+            if skip_unconstrained_trees:
+                if not hasattr(self.mjw_model.opt, "skip_unconstrained_trees"):
+                    raise ValueError(
+                        "skip_unconstrained_trees requires a MuJoCo Warp build with Option.skip_unconstrained_trees."
+                    )
+                if int(self.mjw_model.opt.solver) != int(mujoco.mjtSolver.mjSOL_CG):
+                    raise ValueError("skip_unconstrained_trees requires the CG solver.")
+                self.mjw_model.opt.skip_unconstrained_trees = True
         if use_speculative_contacts:
             if self.mjw_model.opt.integrator not in (
                 mujoco.mjtIntegrator.mjINT_EULER,
