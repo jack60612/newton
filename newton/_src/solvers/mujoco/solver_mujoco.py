@@ -4741,7 +4741,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         self._actuator_dampratio: wp.array2d[float] | None = None
         self._dampratio_moment: wp.array2d[float] | None = None
         self._dampratio_inv_mass_moment: wp.array2d[float] | None = None
-        self._dampratio_solve_scratch: wp.array2d[float] | None = None
         self._notify_body_flags: wp.array[wp.int32] | None = None
         self._notify_joint_armature: wp.array[float] | None = None
         self._notify_joint_rest_q: wp.array[float] | None = None
@@ -10229,8 +10228,6 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         if not self.use_mujoco_cpu:
             self._dampratio_moment = wp.empty((self.mjw_data.nworld, self.mj_model.nv), dtype=float, device=device)
             self._dampratio_inv_mass_moment = wp.empty_like(self._dampratio_moment)
-            # Read copy of MuJoCo Warp's deterministic sparse back-substitution.
-            self._dampratio_solve_scratch = wp.empty_like(self._dampratio_moment)
             if self._notify_qpos_saved is None:
                 self._notify_qpos_saved = wp.empty_like(self.mjw_data.qpos)
 
@@ -10295,11 +10292,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         wp.copy(self._notify_qpos_saved, d.qpos)
         wp.copy(d.qpos, m.qpos0)
         self._mujoco_warp.kinematics(m, d)
-        # The workspace also holds the read copies of MuJoCo Warp's deterministic passes.
-        if workspace is None:
-            self._mujoco_warp.com_pos(m, d)
-        else:
-            self._mujoco_warp.com_pos(m, d, workspace.subtree_com_scratch)
+        self._mujoco_warp.com_pos(m, d)
         if m.ntendon:
             from mujoco_warp._src.smooth import tendon_armature
 
@@ -10307,10 +10300,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._mujoco_warp.tendon(m, d)
             else:
                 self._mujoco_warp.tendon(m, d, workspace.wrap_geom_xpos)
-        if workspace is None:
-            self._mujoco_warp.crb(m, d)
-        else:
-            self._mujoco_warp.crb(m, d, workspace.crb_scratch)
+        self._mujoco_warp.crb(m, d)
         if m.ntendon:
             tendon_armature(m, d)
         if lock:
@@ -10336,7 +10326,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     outputs=[moment],
                     device=self.model.device,
                 )
-                self._mujoco_warp.solve_m(m, d, inv_mass_moment, moment, x_scratch=self._dampratio_solve_scratch)
+                self._mujoco_warp.solve_m(m, d, inv_mass_moment, moment)
                 wp.launch(
                     resolve_actuator_dampratio_kernel,
                     dim=d.nworld,
