@@ -100,7 +100,7 @@ def _flat(array):
     return wp.array(ptr=array.ptr, dtype=float, shape=(count,), device=array.device)
 
 
-def _make_solver(device, kinematic):
+def _make_solver(device, kinematic, deterministic=wp.DeterministicMode.NOT_GUARANTEED):
     with wp.ScopedDevice(device):
         template = newton.ModelBuilder()
         template.add_mjcf(_MJCF, ctrl_direct=True, convert_mjc_equality_constraints=False)
@@ -124,7 +124,9 @@ def _make_solver(device, kinematic):
             values = array.numpy()
             values[[6, width + 6]] = value
             array.assign(values)
-        solver = SolverMuJoCo(model, iterations=2, disable_contacts=False, enable_sleeping=False)
+        solver = SolverMuJoCo(
+            model, iterations=2, disable_contacts=False, enable_sleeping=False, deterministic=deterministic
+        )
         assert np.any(solver.mjc_actuator_ctrl_source.numpy() == int(SolverMuJoCo.CtrlSource.JOINT_TARGET))
         return solver
 
@@ -241,12 +243,15 @@ def test_release_constants_host_parity(device, kinematic):
             np.testing.assert_array_equal(value, _derived(reference)[name], err_msg=f"reset: {name}")
 
 
-def test_release_constants_cuda_replay():
+# RUN_TO_RUN: MuJoCo Warp's deterministic passes read workspace copies, so the refresh stays
+# allocation-free inside its conditional graph node.
+@pytest.mark.parametrize("deterministic", [wp.DeterministicMode.NOT_GUARANTEED, wp.DeterministicMode.RUN_TO_RUN])
+def test_release_constants_cuda_replay(deterministic):
     if not wp.is_cuda_available():
         pytest.skip("CUDA is unavailable")
     with wp.ScopedDevice("cuda:0"):
-        solver = _make_solver("cuda:0", True)
-        reference = _make_solver("cuda:0", True)
+        solver = _make_solver("cuda:0", True, deterministic)
+        reference = _make_solver("cuda:0", True, deterministic)
         refresh = solver.prepare_model_constants_refresh()
         reference.prepare_model_constants_refresh()
         mask = wp.array([False, False], dtype=wp.bool)

@@ -20,18 +20,9 @@ from newton._src.solvers.solver import _set_module_options_if_changed
 from newton._src.solvers.vbd import particle_vbd_kernels, vbd_coupling_kernels
 from newton._src.solvers.xpbd import kernels as xpbd_kernels
 from newton._src.solvers.xpbd import tendon_kernels as xpbd_tendon_kernels
-from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices, warp_version_at_least
+from newton.tests.unittest_utils import add_function_test, get_cuda_test_devices
 
 DETERMINISTIC_MODE = wp.DeterministicMode.RUN_TO_RUN
-
-# Warp 1.19 rejects MuJoCo Warp kernels that read and atomically update one array
-# (_accumulate_subtreemass, _qLD_acc) in deterministic mode.
-_MUJOCO_WARP_DETERMINISM_UNSUPPORTED = warp_version_at_least("1.19.0.dev0")
-
-
-def _skip_unsupported_mujoco_determinism(test):
-    if _MUJOCO_WARP_DETERMINISM_UNSUPPORTED:
-        test.skipTest("MuJoCo Warp does not compile in Warp 1.19 deterministic mode")
 
 
 def _run_isolated(test, function_name, *args):
@@ -202,8 +193,33 @@ def _check_mujoco_sparse_articulation_construction(device):
 
 
 def test_mujoco_sparse_articulation_construction(test, device):
-    _skip_unsupported_mujoco_determinism(test)
     _run_isolated(test, "_check_mujoco_sparse_articulation_construction", str(device))
+
+
+def _check_mujoco_selects_native_determinism(device):
+    import mujoco_warp
+
+    with wp.ScopedDevice(device):
+        model = _build_branching_articulation(device)
+        for mode, expected in (
+            (DETERMINISTIC_MODE, mujoco_warp.DeterminismType.ALL),
+            (wp.DeterministicMode.NOT_GUARANTEED, mujoco_warp.DeterminismType.NONE),
+        ):
+            # A process-wide Warp mode must not reach MuJoCo Warp's modules either way.
+            wp.config.deterministic = DETERMINISTIC_MODE
+            solver = newton.solvers.SolverMuJoCo(model, use_mujoco_cpu=False, disable_contacts=True, deterministic=mode)
+            state_0, state_1 = model.state(), model.state()
+            solver.step(state_0, state_1, model.control(), None, 1.0 / 240.0)
+            if solver.mjw_model.opt.deterministic != expected:
+                raise AssertionError(f"{mode.name}: opt.deterministic is {solver.mjw_model.opt.deterministic}")
+            for name in ("mujoco_warp._src.smooth", "mujoco_warp._src.solver"):
+                options = wp.get_module_options(module=sys.modules[name])
+                if options["deterministic"] != wp.DeterministicMode.NOT_GUARANTEED:
+                    raise AssertionError(f"{mode.name}: {name} compiles in Warp's {options['deterministic'].name} mode")
+
+
+def test_mujoco_selects_native_determinism(test, device):
+    _run_isolated(test, "_check_mujoco_selects_native_determinism", str(device))
 
 
 def _make_articulation_solver(model, solver_name):
@@ -245,8 +261,6 @@ def _check_articulation_determinism(device, solver_name):
 
 
 def test_articulation_determinism(test, device, solver_name):
-    if solver_name == "mujoco":
-        _skip_unsupported_mujoco_determinism(test)
     _run_isolated(test, "_check_articulation_determinism", str(device), solver_name)
 
 
@@ -326,37 +340,6 @@ class TestSolverDeterminismOptions(unittest.TestCase):
         with mock.patch.object(wp, "set_module_options") as set_module_options:
             _set_module_options_if_changed(options, module=xpbd_kernels)
         set_module_options.assert_not_called()
-
-    def test_mujoco_generated_kernel_cache_tracks_determinism(self):
-        from mujoco_warp._src import warp_util
-
-        solver = object.__new__(newton.solvers.SolverMuJoCo)
-        solver._deterministic = DETERMINISTIC_MODE
-        solver._deterministic_max_records = 17
-        cache = warp_util._KERNEL_CACHE
-        saved_cache = cache.copy()
-        saved_options = newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options
-        sentinel = object()
-
-        try:
-            cache.clear()
-            cache["sentinel"] = sentinel
-            newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = None
-
-            solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
-
-            cache["sentinel"] = sentinel
-            solver._prepare_generated_kernels()
-            self.assertIs(cache["sentinel"], sentinel)
-
-            solver._deterministic_max_records += 1
-            solver._prepare_generated_kernels()
-            self.assertEqual(cache, {})
-        finally:
-            cache.clear()
-            cache.update(saved_cache)
-            newton.solvers.SolverMuJoCo._generated_kernel_deterministic_options = saved_options
 
     def test_current_solver_skips_module_option_checks(self):
         model = newton.ModelBuilder().finalize(device="cpu")
@@ -490,6 +473,14 @@ add_function_test(
     TestSolverDeterminism,
     "test_mujoco_sparse_articulation_construction",
     test_mujoco_sparse_articulation_construction,
+    devices=devices,
+    check_output=False,
+)
+
+add_function_test(
+    TestSolverDeterminism,
+    "test_mujoco_selects_native_determinism",
+    test_mujoco_selects_native_determinism,
     devices=devices,
     check_output=False,
 )

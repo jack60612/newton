@@ -123,12 +123,15 @@ GPU models); Newton only tests ``RUN_TO_RUN``.
        observable sums contact wrenches with atomics and is outside the
        guarantee. See ``python -m newton.examples steel_determinism_arms``.
    * - :class:`~solvers.SolverMuJoCo`
-     - CPU only
-     - The CPU backend (``use_mujoco_cpu=True``) is always deterministic. On
-       the MuJoCo Warp backend, ``deterministic`` currently fails to compile
-       MuJoCo Warp's kernels with Warp 1.19, and MuJoCo Warp does not yet
-       order its contacts or constraint rows. Tracked in
-       `#5042 <https://github.com/newton-physics/newton/issues/5042>`__.
+     - Yes
+     - ``RUN_TO_RUN`` selects MuJoCo Warp's own deterministic option
+       (``Model.opt.deterministic``): MuJoCo Warp sorts its contacts and
+       constraint rows and opts its atomic kernels into Warp's deterministic
+       mode with record bounds it sizes itself; Newton's contact conversion
+       uses Warp's deterministic mode. MuJoCo Warp's modules never inherit
+       Warp's mode, which MuJoCo Warp does not support. ``RUN_TO_RUN`` only;
+       ``GPU_TO_GPU`` raises. The CPU backend (``use_mujoco_cpu=True``) is
+       always deterministic.
    * - :class:`~solvers.SolverStyle3D`
      - No
      - Accumulates cloth and contact forces with floating-point atomics.
