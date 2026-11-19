@@ -114,8 +114,19 @@ def Xform "World" {
                 guide_group.CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
 
                 expected = {}
-
-                def site(path, kind, visible, *, purpose=None, visibility=None):
+                cases = (
+                    ("/visible", "sphere", True, None, None),
+                    ("/proxy", "sphere", True, UsdGeom.Tokens.proxy, None),
+                    ("/hidden", "sphere", False, None, UsdGeom.Tokens.invisible),
+                    ("/guide", "box", False, UsdGeom.Tokens.guide, None),
+                    ("/render", "sphere", False, UsdGeom.Tokens.render, None),
+                    ("/invisible_group/child", "sphere", False, None, None),
+                    ("/guide_group/child", "sphere", False, None, None),
+                    ("/hidden_mesh", "mesh", False, None, UsdGeom.Tokens.invisible),
+                    ("/visible_plane", "plane", True, None, None),
+                )
+                for suffix, kind, visible, purpose, visibility in cases:
+                    path = root + suffix
                     if kind == "mesh":
                         geom = UsdGeom.Mesh.Define(stage, path)
                         geom.CreatePointsAttr().Set([(0, 0, 0), (1, 0, 0), (0, 1, 0)])
@@ -133,16 +144,6 @@ def Xform "World" {
                     if visibility is not None:
                         geom.CreateVisibilityAttr().Set(visibility)
                     expected[path] = visible
-
-                site(root + "/visible", "sphere", True)
-                site(root + "/proxy", "sphere", True, purpose=UsdGeom.Tokens.proxy)
-                site(root + "/hidden", "sphere", False, visibility=UsdGeom.Tokens.invisible)
-                site(root + "/guide", "box", False, purpose=UsdGeom.Tokens.guide)
-                site(root + "/render", "sphere", False, purpose=UsdGeom.Tokens.render)
-                site(root + "/invisible_group/child", "sphere", False)
-                site(root + "/guide_group/child", "sphere", False)
-                site(root + "/hidden_mesh", "mesh", False, visibility=UsdGeom.Tokens.invisible)
-                site(root + "/visible_plane", "plane", True)
 
                 builder = newton.ModelBuilder()
                 result = builder.add_usd(stage, load_visual_shapes=False)

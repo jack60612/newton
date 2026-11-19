@@ -68,46 +68,50 @@ def _transforms(count, device):
     return wp.array(np.tile([0, 0, 0, 0, 0, 0, 1], (count, 1)), dtype=wp.transformf, device=device)
 
 
+def _check_raycast_camera_and_cloned_worlds(test, device, transform, expected):
+    model = _cloned_scene(device, transform=transform)
+    test.assertTrue(model._ray_opacity.has_cutouts)
+    origins, directions, worlds = _query_arrays(device)
+    distances = wp.empty(4, dtype=wp.float32, device=device)
+    hit_shapes = wp.empty(4, dtype=wp.int32, device=device)
+    truncated = wp.empty(4, dtype=wp.int32, device=device)
+    camera = SensorCamera(model)
+    camera_rays = _camera_rays(device)
+    state = model.state()
+    poses = _transforms(2, device)
+    depth = camera.allocate_image_depth(2, 2, 1)
+    shape = camera.allocate_image_shape_index(2, 2, 1)
+
+    def cast_and_render():
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            out_dist=distances,
+            out_shape_id=hit_shapes,
+            out_truncated=truncated,
+        )
+        camera.update(state, poses, camera_rays, depth_image=depth, shape_index_image=shape)
+
+    cast_and_render()
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast_and_render()
+        wp.capture_launch(capture.graph)
+    np.testing.assert_array_equal(truncated.numpy(), [0, 0, 0, 0])
+    np.testing.assert_allclose(distances.numpy(), expected * 2, atol=1.0e-5)
+    np.testing.assert_allclose(depth.numpy().reshape(-1), expected * 2, atol=1.0e-5)
+    np.testing.assert_array_equal(hit_shapes.numpy().astype(np.uint32), shape.numpy().reshape(-1))
+    np.testing.assert_array_equal(model.shape_world.numpy()[hit_shapes.numpy()], [0, 0, 1, 1])
+
+
 def test_raycast_camera_and_cloned_worlds(test: TestRayOpacity, device: str):
     for transform, expected in (
         (((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)), [3.0, 2.0]),
         (((1.0, 0.0, 0.5), (0.0, 1.0, 0.0)), [2.0, 3.0]),
     ):
-        model = _cloned_scene(device, transform=transform)
-        test.assertTrue(model._ray_opacity.has_cutouts)
-        origins, directions, worlds = _query_arrays(device)
-        distances = wp.empty(4, dtype=wp.float32, device=device)
-        hit_shapes = wp.empty(4, dtype=wp.int32, device=device)
-        truncated = wp.empty(4, dtype=wp.int32, device=device)
-        camera = SensorCamera(model)
-        camera_rays = _camera_rays(device)
-        state = model.state()
-        poses = _transforms(2, device)
-        depth = camera.allocate_image_depth(2, 2, 1)
-        shape = camera.allocate_image_shape_index(2, 2, 1)
-
-        def cast_and_render():
-            newton.intersect_ray(
-                model,
-                ray_origins=origins,
-                ray_directions=directions,
-                ray_worlds=worlds,
-                out_dist=distances,
-                out_shape_id=hit_shapes,
-                out_truncated=truncated,
-            )
-            camera.update(state, poses, camera_rays, depth_image=depth, shape_index_image=shape)
-
-        cast_and_render()
-        if wp.get_device(device).is_cuda:
-            with wp.ScopedCapture(device=device) as capture:
-                cast_and_render()
-            wp.capture_launch(capture.graph)
-        np.testing.assert_array_equal(truncated.numpy(), [0, 0, 0, 0])
-        np.testing.assert_allclose(distances.numpy(), expected * 2, atol=1.0e-5)
-        np.testing.assert_allclose(depth.numpy().reshape(-1), expected * 2, atol=1.0e-5)
-        np.testing.assert_array_equal(hit_shapes.numpy().astype(np.uint32), shape.numpy().reshape(-1))
-        np.testing.assert_array_equal(model.shape_world.numpy()[hit_shapes.numpy()], [0, 0, 1, 1])
+        _check_raycast_camera_and_cloned_worlds(test, device, transform, expected)
 
 
 def test_alpha_cutout_shadow_matches_ray(test: TestRayOpacity, device: str):

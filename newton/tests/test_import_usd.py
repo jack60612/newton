@@ -35,6 +35,7 @@ from newton._src.solvers.mujoco.constants import (
 from newton._src.solvers.mujoco.utils import MjcEqualityTargetKind
 from newton._src.usd import utils as usd_utils
 from newton._src.utils.color import color_linear_to_srgb
+from newton._src.utils.texture import load_texture
 from newton.math import quat_between_axes
 from newton.solvers import SolverMuJoCo
 from newton.tests._usd_import_test_utils import _expect_jointless_articulation_warning
@@ -5750,8 +5751,6 @@ def Xform "Articulation" (
         """Import the actual alpha channel and preserve its mapping in all world copies."""
         from PIL import Image
 
-        from newton._src.utils.texture import load_texture
-
         pixels = np.array(
             [[[30, 70, 90, 0], [30, 70, 90, 64]], [[30, 70, 90, 128], [30, 70, 90, 255]]],
             dtype=np.uint8,
@@ -5796,7 +5795,7 @@ def Xform "Articulation" (
         """A material subset keeps its own split face-corner UVs and cutout metadata."""
         from pxr import UsdGeom, UsdShade, Vt
 
-        stage, prim, _, _, expected_uvs = self._make_cutout_stage("leaf.png", face_varying=True)
+        stage, _, _, _, expected_uvs = self._make_cutout_stage("leaf.png", face_varying=True)
         subset = UsdGeom.Subset.Define(stage, "/World/Leaf/cutout")
         subset.CreateElementTypeAttr().Set(UsdGeom.Tokens.face)
         subset.CreateFamilyNameAttr().Set("materialBind")
