@@ -10,6 +10,7 @@ select their current entry on the device, so selection is graph-capturable.
 
 from __future__ import annotations
 
+import hashlib
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -47,24 +48,57 @@ class RayOpacityTable:
         self._resources = []
         materials = []
         source_ids: dict[int, int] = {}
+        material_ids: dict[tuple, int] = {}
+        uv_arrays: dict[tuple, wp.array] = {}
         textures: dict[tuple, wp.Texture2D] = {}
+        array_ids: dict[int, tuple] = {}
+        array_candidates: dict[tuple, list[tuple[np.ndarray, tuple]]] = {}
+        array_representatives = 0
+
+        def texture_identity(texture):
+            nonlocal array_representatives
+            if isinstance(texture, str):
+                return ("path", texture)
+            identity = id(texture)
+            if identity in array_ids:
+                return array_ids[identity]
+            digest = hashlib.blake2b(memoryview(texture).cast("B"), digest_size=16).digest()
+            fingerprint = (texture.shape, texture.dtype.str, digest)
+            candidates = array_candidates.setdefault(fingerprint, [])
+            for previous, key in candidates:
+                # The digest only narrows candidates: a collision must never alias distinct alpha masks.
+                if np.array_equal(previous.view(np.uint8), texture.view(np.uint8)):
+                    array_ids[identity] = key
+                    return key
+            key = ("array", array_representatives)
+            array_representatives += 1
+            candidates.append((texture, key))
+            array_ids[identity] = key
+            return key
 
         def material_id(source):
             if not isinstance(source, Mesh) or not source.opacity_threshold:
                 return -1
-            key = id(source)
-            if key in source_ids:
-                return source_ids[key]
-            item = RayOpacity()
-            item.threshold = source.opacity_threshold
-            item.double_sided = int(source.double_sided)
+            source_key = id(source)
+            if source_key in source_ids:
+                return source_ids[source_key]
             opacity_texture = source.opacity_texture
+            texture_key = None
+            uv_key = None
             if opacity_texture is not None:
                 if source.uvs is None or len(source.uvs) != len(source.vertices):
                     raise ValueError("An opacity texture requires one UV coordinate per mesh vertex")
-                texture_key = (
-                    ("path", opacity_texture) if isinstance(opacity_texture, str) else ("array", id(opacity_texture))
-                )
+                texture_key = texture_identity(opacity_texture)
+                uv_key = (source.uvs.shape, source.uvs.tobytes(), source.texture_transform)
+            key = (source.opacity_threshold, source.double_sided, texture_key, uv_key)
+            if key in material_ids:
+                source_ids[source_key] = material_ids[key]
+                return material_ids[key]
+            item = RayOpacity()
+            item.threshold = source.opacity_threshold
+            item.double_sided = int(source.double_sided)
+            if opacity_texture is not None:
+                assert texture_key is not None and uv_key is not None
                 if texture_key not in textures:
                     pixels = load_texture(opacity_texture)
                     if pixels is None:
@@ -81,16 +115,18 @@ class RayOpacityTable:
                         num_channels=4,
                         device=model.device,
                     )
-                transform = np.asarray(source.texture_transform, dtype=np.float32)
-                uv = np.asarray(source.uvs, dtype=np.float32) @ transform[:, :2].T + transform[:, 2]
-                uv_array = wp.array(uv, dtype=wp.vec2f, device=model.device)
-                self._resources.append(uv_array)
-                item.uvs = uv_array
+                if uv_key not in uv_arrays:
+                    transform = np.asarray(source.texture_transform, dtype=np.float32)
+                    uv = np.asarray(source.uvs, dtype=np.float32) @ transform[:, :2].T + transform[:, 2]
+                    uv_arrays[uv_key] = wp.array(uv, dtype=wp.vec2f, device=model.device)
+                    self._resources.append(uv_arrays[uv_key])
+                item.uvs = uv_arrays[uv_key]
                 item.texture = textures[texture_key]
                 item.has_texture = 1
-            source_ids[key] = len(materials)
+            material_ids[key] = len(materials)
+            source_ids[source_key] = material_ids[key]
             materials.append(item)
-            return source_ids[key]
+            return material_ids[key]
 
         # Do not allocate device tables or load any textures for models without
         # authored cutouts.  The ordinary raycast and camera kernels then keep

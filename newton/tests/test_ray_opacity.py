@@ -358,6 +358,82 @@ def test_disabled_ray_mask_returns_miss_without_truncation(test: TestRayOpacity,
     np.testing.assert_array_equal(truncated.numpy(), [0, 0, 0, 0])
 
 
+def test_cutout_materials_share_resources_without_aliasing(test: TestRayOpacity, device: str):
+    base = _quad(0.0, cutout=True)
+    mask = _rgba_mask()
+    mask[:, :4, 3] = 100
+    base.opacity_texture = mask
+    copies = [base.copy() for _ in range(12)]
+    different_uv = base.copy()
+    different_uv.uvs[:, 0] += 0.5
+    different_transform = base.copy()
+    different_transform.texture_transform = ((1.0, 0.0, 0.5), (0.0, 1.0, 0.0))
+    different_mask = base.copy()
+    different_mask.opacity_texture[:, :4, 3] = 255
+    different_threshold = base.copy()
+    different_threshold.opacity_threshold = 0.25
+    different_sidedness = base.copy()
+    different_sidedness.double_sided = False
+    scalar_low = base.copy()
+    scalar_low.opacity_texture = None
+    scalar_low.opacity = 0.49
+    scalar_equal = scalar_low.copy()
+    scalar_equal.opacity = 0.5
+    variants = [
+        different_uv,
+        different_transform,
+        different_mask,
+        different_threshold,
+        different_sidedness,
+        scalar_low,
+        scalar_equal,
+    ]
+
+    # Distinct source objects and texture arrays model USD imports, then clone
+    # them into the 256-world configuration. Device resources scale with the
+    # distinct alpha/UV inputs, not with leaves or cloned worlds.
+    prototype = newton.ModelBuilder()
+    for source in copies + variants:
+        prototype.add_shape_mesh(-1, mesh=source)
+    builder = newton.ModelBuilder()
+    builder.replicate(prototype, copy_count=256)
+    model = builder.finalize(device=device)
+    table = model._ray_opacity
+    ids = table.shapes.numpy()
+    test.assertEqual(len(ids), 19 * 256)
+    test.assertEqual(len(np.unique(ids)), 7)
+    test.assertEqual(np.count_nonzero(ids == ids[0]), 12 * 256)
+    test.assertEqual(len(table.materials), 7)
+    test.assertEqual(len(table._resources), 5)  # three UV buffers and two textures
+
+    # The same alpha data may be shared even when the source meshes differ,
+    # but changing UVs, transform, mask, threshold or per-shape scalar opacity
+    # must still change the actual ray result.
+    semantic = newton.ModelBuilder()
+    cases = [copies[0], copies[1], *variants]
+    for source in cases:
+        semantic.begin_world()
+        semantic.add_shape_mesh(-1, mesh=source)
+        semantic.add_shape_mesh(-1, mesh=_quad(-1.0))
+        semantic.end_world()
+    model = semantic.finalize(device=device)
+    origins = wp.array([[-0.5, 0.0, 2.0]] * len(cases), dtype=wp.vec3f, device=device)
+    directions = wp.array([[0.0, 0.0, -1.0]] * len(cases), dtype=wp.vec3f, device=device)
+    worlds = wp.array(np.arange(len(cases)), dtype=wp.int32, device=device)
+    distances = wp.empty(len(cases), dtype=wp.float32, device=device)
+    truncated = wp.empty(len(cases), dtype=wp.int32, device=device)
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_dist=distances,
+        out_truncated=truncated,
+    )
+    np.testing.assert_allclose(distances.numpy(), [3.0, 3.0, 2.0, 2.0, 2.0, 2.0, 3.0, 3.0, 2.0], atol=1.0e-5)
+    np.testing.assert_array_equal(truncated.numpy(), np.zeros(len(cases), dtype=np.int32))
+
+
 devices = get_test_devices()
 add_function_test(
     TestRayOpacity, "test_raycast_camera_and_cloned_worlds", test_raycast_camera_and_cloned_worlds, devices=devices
@@ -396,6 +472,12 @@ add_function_test(
     TestRayOpacity,
     "test_disabled_ray_mask_returns_miss_without_truncation",
     test_disabled_ray_mask_returns_miss_without_truncation,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_cutout_materials_share_resources_without_aliasing",
+    test_cutout_materials_share_resources_without_aliasing,
     devices=devices,
 )
 
