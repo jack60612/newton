@@ -86,6 +86,81 @@ def Xform "World"
         pos = wp.transform_get_translation(xform)
         np.testing.assert_allclose([pos[0], pos[1], pos[2]], [0.1, 0, 0], atol=1e-5)
 
+    def test_site_visibility_and_purpose_preserve_site_identity(self):
+        """USD visibility affects drawing, not site registration, collision, or body mass."""
+        from pxr import Sdf, UsdGeom
+
+        for schema in ("NewtonSiteAPI", "MjcSiteAPI"):
+            with self.subTest(schema=schema):
+                stage = self._create_usd_stage(
+                    """#usda 1.0
+(
+    upAxis = "Z"
+)
+def Xform "World" {
+    def Xform "body" (
+        prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
+    ) {
+        float physics:mass = 1.0
+        float3 physics:diagonalInertia = (0.1, 0.1, 0.1)
+    }
+}
+"""
+                )
+                root = "/World/body"
+                invisible_group = UsdGeom.Xform.Define(stage, root + "/invisible_group")
+                invisible_group.CreateVisibilityAttr().Set(UsdGeom.Tokens.invisible)
+                guide_group = UsdGeom.Xform.Define(stage, root + "/guide_group")
+                guide_group.CreatePurposeAttr().Set(UsdGeom.Tokens.guide)
+
+                expected = {}
+
+                def site(path, kind, visible, *, purpose=None, visibility=None):
+                    if kind == "mesh":
+                        geom = UsdGeom.Mesh.Define(stage, path)
+                        geom.CreatePointsAttr().Set([(0, 0, 0), (1, 0, 0), (0, 1, 0)])
+                        geom.CreateFaceVertexCountsAttr().Set([3])
+                        geom.CreateFaceVertexIndicesAttr().Set([0, 1, 2])
+                    elif kind == "plane":
+                        geom = UsdGeom.Plane.Define(stage, path)
+                    elif kind == "box":
+                        geom = UsdGeom.Cube.Define(stage, path)
+                    else:
+                        geom = UsdGeom.Sphere.Define(stage, path)
+                    geom.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=[schema]))
+                    if purpose is not None:
+                        geom.CreatePurposeAttr().Set(purpose)
+                    if visibility is not None:
+                        geom.CreateVisibilityAttr().Set(visibility)
+                    expected[path] = visible
+
+                site(root + "/visible", "sphere", True)
+                site(root + "/proxy", "sphere", True, purpose=UsdGeom.Tokens.proxy)
+                site(root + "/hidden", "sphere", False, visibility=UsdGeom.Tokens.invisible)
+                site(root + "/guide", "box", False, purpose=UsdGeom.Tokens.guide)
+                site(root + "/render", "sphere", False, purpose=UsdGeom.Tokens.render)
+                site(root + "/invisible_group/child", "sphere", False)
+                site(root + "/guide_group/child", "sphere", False)
+                site(root + "/hidden_mesh", "mesh", False, visibility=UsdGeom.Tokens.invisible)
+                site(root + "/visible_plane", "plane", True)
+
+                builder = newton.ModelBuilder()
+                result = builder.add_usd(stage, load_visual_shapes=False)
+                model = builder.finalize(device="cpu")
+                flags = model.shape_flags.numpy()
+                self.assertAlmostEqual(float(model.body_mass.numpy()[0]), 1.0)
+                for path, visible in expected.items():
+                    index = result["path_shape_map"][path]
+                    self.assertTrue(flags[index] & ShapeFlags.SITE, path)
+                    self.assertEqual(bool(flags[index] & ShapeFlags.VISIBLE), visible, path)
+                    self.assertFalse(flags[index] & ShapeFlags.COLLIDE_SHAPES, path)
+                    self.assertFalse(flags[index] & ShapeFlags.COLLIDE_PARTICLES, path)
+                    self.assertEqual(builder.shape_collision_group[index], 0, path)
+
+                no_sites = newton.ModelBuilder()
+                no_sites.add_usd(stage, load_sites=False, load_visual_shapes=False)
+                self.assertFalse(any(flags & ShapeFlags.SITE for flags in no_sites.shape_flags))
+
     def test_body_local_site_position_rounds_only_after_world_subtraction(self):
         """Retain small authored site offsets on translated and rotated bodies."""
         from pxr import Gf, Sdf, UsdGeom

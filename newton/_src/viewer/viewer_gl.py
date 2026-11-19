@@ -166,6 +166,7 @@ class ViewerGL(ViewerBase):
     Newton models using OpenGL rendering. It supports real-time simulation control,
     camera navigation, object picking, wind effects, and a rich ImGui-based UI for
     model introspection and visualization options.
+    Interactive picking uses physics collision geometry, not visual alpha cutouts.
 
     Key Features:
         - Real-time 3D rendering of Newton models and simulation states.
@@ -899,6 +900,37 @@ class ViewerGL(ViewerBase):
             self.camera.yaw = (yaw + 180.0) % 360.0 - 180.0
         self.camera.sync_pivot_to_view()
 
+    def _apply_mesh_render_material(self, name: str, source: nt.Mesh) -> None:
+        """Apply authored mesh sidedness and cutout data to the GL prototype."""
+        mesh = self.objects[self._qualify(name)]
+        if source.opacity_threshold and source.opacity_texture is not None and source._uvs is None:
+            raise ValueError("An opacity texture requires mesh UVs")
+        mesh.set_cutout(source.opacity_threshold, source.opacity_texture)
+        mesh.opacity = 1.0 if source.opacity is None else float(source.opacity)
+        mesh.backface_culling = not source.double_sided
+
+    @override
+    def log_geo(
+        self,
+        name: str,
+        geo_type: int,
+        geo_scale: tuple[float, ...],
+        geo_thickness: float,
+        geo_is_solid: bool,
+        geo_src: nt.Mesh | nt.Heightfield | None = None,
+        hidden: bool = False,
+    ):
+        super().log_geo(name, geo_type, geo_scale, geo_thickness, geo_is_solid, geo_src, hidden)
+        if geo_type in (nt.GeoType.MESH, nt.GeoType.CONVEX_MESH) and isinstance(geo_src, nt.Mesh):
+            self._apply_mesh_render_material(name, geo_src)
+
+    @override
+    def _log_mesh_winding_flipped(
+        self, name: str, src: nt.Mesh, thickness: float, is_solid: bool, hidden: bool
+    ) -> None:
+        super()._log_mesh_winding_flipped(name, src, thickness, is_solid, hidden)
+        self._apply_mesh_render_material(name, src)
+
     @override
     def log_mesh(
         self,
@@ -952,6 +984,9 @@ class ViewerGL(ViewerBase):
             dynamic,
             opacity,
         )
+        mesh = self.objects[self._qualify(name)]
+        if mesh.opacity_threshold > 0.0:
+            mesh.set_cutout(None, None)
 
     @override
     def _log_deformable_visual_mesh(self, name, points, indices, *, hidden=False, **kwargs):
@@ -1885,9 +1920,15 @@ class ViewerGL(ViewerBase):
                     and count > 0
                 )
                 colors = shapes.colors if self.model_changed or shapes.colors_changed else None
+                prototype = self.objects.get(shapes.mesh)
+                scalar_cutout = (
+                    isinstance(prototype, MeshGL)
+                    and prototype.opacity_threshold > 0.0
+                    and prototype.opacity_texture_id is None
+                )
                 opacities = (
                     shapes.opacities
-                    if shapes.transparent and (self.model_changed or shapes.opacities_changed)
+                    if (shapes.transparent or scalar_cutout) and (self.model_changed or shapes.opacities_changed)
                     else None
                 )
                 materials = shapes.materials if self.model_changed else None

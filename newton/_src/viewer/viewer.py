@@ -63,7 +63,11 @@ def _mesh_texture_uvs(mesh: newton.Mesh) -> np.ndarray | None:
     """Return authored UVs with the mesh's affine texture transform applied."""
     uvs = mesh._uvs
     texture_transform = mesh.texture_transform
-    if uvs is None or mesh.texture is None or texture_transform == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)):
+    if (
+        uvs is None
+        or (mesh.texture is None and mesh.opacity_texture is None)
+        or texture_transform == ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+    ):
         return uvs
     transform = np.asarray(texture_transform, dtype=uvs.dtype)
     return uvs @ transform[:, :2].T + transform[:, 2]

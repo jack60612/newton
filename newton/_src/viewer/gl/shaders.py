@@ -37,12 +37,19 @@ shadow_vertex_shader = (
     + capsule_vertex_transform
     + """
 layout (location = 0) in vec3 aPos;
+layout (location = 2) in vec2 aTexCoord;
 
 // column vectors of the instance transform matrix
 layout (location = 3) in vec4 aInstanceTransform0;
 layout (location = 4) in vec4 aInstanceTransform1;
 layout (location = 5) in vec4 aInstanceTransform2;
 layout (location = 6) in vec4 aInstanceTransform3;
+layout (location = 9) in float aOpacity;
+layout (location = 11) in vec2 aCutout;
+
+out vec2 TexCoord;
+out float Opacity;
+flat out vec2 Cutout;
 
 uniform mat4 light_space_matrix;
 uniform vec3 render_origin;
@@ -51,16 +58,40 @@ void main()
 {
     mat4 transform = mat4(aInstanceTransform0, aInstanceTransform1, aInstanceTransform2, aInstanceTransform3);
     vec3 render_position = mat3(transform) * mesh_position(aPos, transform) + transform[3].xyz - render_origin;
+    TexCoord = aTexCoord;
+    Opacity = aOpacity;
+    Cutout = aCutout;
     gl_Position = light_space_matrix * vec4(render_position, 1.0);
 }
 """
 )
 
-shadow_fragment_shader = """
-#version 330 core
-
-void main() { }
+alpha_cutout_fragment = """
+void apply_alpha_cutout(vec2 uv, float opacity, vec2 cutout)
+{
+    if (cutout.x > 0.0)
+    {
+        // Use base-level bilinear alpha, matching the ray-traced material.
+        float alpha = cutout.y > 0.5 ? textureLod(opacity_map, uv, 0.0).a : opacity;
+        if (alpha < cutout.x) discard;
+    }
+}
 """
+
+
+shadow_fragment_shader = (
+    """
+#version 330 core
+in vec2 TexCoord;
+in float Opacity;
+flat in vec2 Cutout;
+uniform sampler2D opacity_map;
+"""
+    + alpha_cutout_fragment
+    + """
+void main() { apply_alpha_cutout(TexCoord, Opacity, Cutout); }
+"""
+)
 
 
 shape_vertex_shader = (
@@ -85,9 +116,8 @@ layout (location = 7) in vec3 aObjectColor;
 // material properties
 layout (location = 8) in vec4 aMaterial;
 
-#ifdef ENABLE_TRANSPARENCY
 layout (location = 9) in float aOpacity;
-#endif
+layout (location = 11) in vec2 aCutout;
 
 uniform mat4 view;
 uniform mat4 projection;
@@ -98,8 +128,9 @@ out vec3 LocalPos;
 out vec2 TexCoord;
 out vec3 ObjectColor;
 out vec4 Material;
-#ifdef ENABLE_TRANSPARENCY
 out float Opacity;
+flat out vec2 Cutout;
+#ifdef ENABLE_TRANSPARENCY
 out float ViewDepth;
 #endif
 
@@ -125,15 +156,17 @@ void main()
     TexCoord = aTexCoord;
     ObjectColor = aObjectColor;
     Material = aMaterial;
-#ifdef ENABLE_TRANSPARENCY
     Opacity = clamp(aOpacity, 0.0, 1.0);
+    Cutout = aCutout;
+#ifdef ENABLE_TRANSPARENCY
     ViewDepth = max(-view_position.z, 0.0);
 #endif
 }
 """
 )
 
-shape_fragment_shader = """
+shape_fragment_shader = (
+    """
 #version 330 core
 #ifdef ENABLE_TRANSPARENCY
 layout (location = 0) out vec4 FragColor;
@@ -147,8 +180,9 @@ in vec3 LocalPos;
 in vec2 TexCoord;
 in vec3 ObjectColor;
 in vec4 Material;
-#ifdef ENABLE_TRANSPARENCY
 in float Opacity;
+flat in vec2 Cutout;
+#ifdef ENABLE_TRANSPARENCY
 in float ViewDepth;
 
 // Reciprocal of the reference distance to the transparent content. Normalizing
@@ -172,6 +206,7 @@ uniform sampler2D shadow_map;
 uniform sampler2D env_map;
 uniform float env_intensity;
 uniform sampler2D albedo_map;
+uniform sampler2D opacity_map;
 
 uniform vec3 fogColor;
 uniform int up_axis;
@@ -185,6 +220,9 @@ uniform float specular_scale;
 uniform bool spotlight_enabled;
 uniform float exposure;
 
+"""
+    + alpha_cutout_fragment
+    + """
 const float PI = 3.14159265359;
 
 float rand(vec2 co){
@@ -366,6 +404,8 @@ vec3 sample_env_map(vec3 dir, float lod)
 
 void main()
 {
+    apply_alpha_cutout(TexCoord, Opacity, Cutout);
+
     // This reconstruction also corrects depth before the fragment is committed.
     vec3 camera_to_fragment = ReconstructCameraRelativePosition();
 
@@ -515,6 +555,7 @@ void main()
 #endif
 }
 """
+)
 
 
 sky_vertex_shader = """
@@ -692,6 +733,8 @@ class ShaderShape(ShaderGL):
             self.loc_light_space_matrix = self._get_uniform_location("light_space_matrix")
             self.loc_shadow_map = self._get_uniform_location("shadow_map")
             self.loc_albedo_map = self._get_uniform_location("albedo_map")
+            self.loc_opacity_map = self._get_uniform_location("opacity_map")
+            self._gl.glUniform1i(self.loc_opacity_map, 3)
             self.loc_env_map = self._get_uniform_location("env_map")
             self.loc_env_intensity = self._get_uniform_location("env_intensity")
             self.loc_fog_color = self._get_uniform_location("fogColor")
@@ -872,6 +915,7 @@ class ShadowShader(ShaderGL):
         with self:
             self.loc_light_space_matrix = self._get_uniform_location("light_space_matrix")
             self.loc_render_origin = self._get_uniform_location("render_origin")
+            self._gl.glUniform1i(self._get_uniform_location("opacity_map"), 3)
 
     def update(self, light_space_matrix: np.ndarray, render_origin: tuple[float, float, float]):
         """Update light space matrix for shadow rendering."""
@@ -1175,15 +1219,25 @@ class ShaderArrow(ShaderGL):
         self._gl.glUniformMatrix4fv(self.loc_world, 1, self._gl.GL_FALSE, arr_pointer(world))
 
 
-edge_fragment_shader = """
+edge_fragment_shader = (
+    """
 #version 330 core
 out vec4 FragColor;
+in vec2 TexCoord;
+in float Opacity;
+flat in vec2 Cutout;
 uniform vec4 edge_color;
+uniform sampler2D opacity_map;
+"""
+    + alpha_cutout_fragment
+    + """
 void main()
 {
+    apply_alpha_cutout(TexCoord, Opacity, Cutout);
     FragColor = edge_color;
 }
 """
+)
 
 
 class ShaderEdge(ShaderGL):
@@ -1203,6 +1257,7 @@ class ShaderEdge(ShaderGL):
             self.loc_projection = self._get_uniform_location("projection")
             self.loc_view_pos = self._get_uniform_location("view_pos")
             self.loc_edge_color = self._get_uniform_location("edge_color")
+            self._gl.glUniform1i(self._get_uniform_location("opacity_map"), 3)
 
     def update(
         self,

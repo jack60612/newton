@@ -11,6 +11,7 @@ import warp as wp
 
 from ..core import MAXVAL
 from .bvh import BVH_SHAPE_INACTIVE
+from .ray_opacity import RayOpacity, material_index, ray_intersect_mesh_cutout
 from .types import GeoType
 
 if TYPE_CHECKING:
@@ -929,10 +930,13 @@ def intersect_ray(
     ray_origins: wp.array[wp.vec3],
     ray_directions: wp.array[wp.vec3],
     ray_worlds: wp.array[wp.int32],
+    ray_enabled: wp.array[wp.bool] | None = None,
     enable_global_world: bool = True,
     out_dist: wp.array[float] | None = None,
     out_shape_id: wp.array[wp.int32] | None = None,
     out_normal: wp.array[wp.vec3] | None = None,
+    out_truncated: wp.array[wp.int32] | None = None,
+    max_alpha_rejections: int = 8,
     fast_math: bool = True,
 ):
     """Intersect rays with model shapes.
@@ -948,6 +952,15 @@ def intersect_ray(
     which are accessible from every world. A ray whose world is ``-1`` is cast
     against the global world only.
 
+    Mesh materials with a positive opacity threshold reject texels below that
+    threshold and continue the native mesh query. The rejection budget applies
+    per ray across all candidate shapes and worlds. When it is exhausted, the
+    result is a miss and ``out_truncated`` is 1; this output is required for a
+    model with cutouts so incomplete rays cannot be silently mistaken for misses.
+    Warp has no minimum-distance mesh query, so continuation advances the ray
+    parameter by one float32 ULP per rejection. Coplanar or closer-than-rounding
+    intersections in the same mesh are ambiguous.
+
     ``out_dist``, ``out_shape_id`` and ``out_normal`` are optional outputs.
     Pass ``None`` to skip writing a channel.
 
@@ -958,12 +971,19 @@ def intersect_ray(
             Values must be normalized and nonzero.
         ray_worlds: Per-ray world index, shape [ray_count]. Use ``-1`` for the
             global world.
+        ray_enabled: Optional per-ray mask, shape [ray_count]. Disabled rays
+            return the normal miss outputs without traversing the BVH.
         enable_global_world: Whether to enable global world raycasting.
         out_dist: Optional output hit distances [m], shape [ray_count]. ``-1`` on miss.
         out_shape_id: Optional output hit shape indices, shape [ray_count]. ``-1`` on miss.
         out_normal: Optional output hit normals, shape [ray_count, 3].
+        out_truncated: Per-ray int32 diagnostic, 1 on exhausted budget, 0 otherwise.
+            Required if the model has cutout materials; shape [ray_count].
+        max_alpha_rejections: Maximum rejected triangles per ray before reporting truncation.
         fast_math: Whether to compile the intersection kernel with fast math enabled.
     """
+    if max_alpha_rejections < 0:
+        raise ValueError("max_alpha_rejections must be nonnegative")
 
     if model.bvh_shape_enabled is not None and model.bvh_shape_count_enabled == 0:
         # The shape BVH was built but no shape was selected, so every ray misses.
@@ -973,6 +993,8 @@ def intersect_ray(
             out_shape_id.fill_(-1)
         if out_normal is not None:
             out_normal.zero_()
+        if out_truncated is not None:
+            out_truncated.zero_()
         return
 
     if model.bvh_shapes is None:
@@ -986,6 +1008,12 @@ def intersect_ray(
     write_dist = out_dist is not None
     write_shape_id = out_shape_id is not None
     write_normal = out_normal is not None
+    write_truncated = out_truncated is not None
+    has_ray_mask = ray_enabled is not None
+    cutouts = model._ray_opacity
+    has_cutouts = cutouts is not None and cutouts.has_cutouts
+    if has_cutouts and out_truncated is None:
+        raise ValueError("out_truncated is required when the model contains opacity cutouts")
 
     @wp.kernel(enable_backward=False, module="unique", module_options={"fast_math": fast_math})
     def _intersect_ray_kernel(
@@ -996,14 +1024,32 @@ def intersect_ray(
         shape_type: wp.array[int],
         shape_scale: wp.array[wp.vec3],
         shape_source_ptr: wp.array[wp.uint64],
+        shape_opacity: wp.array[wp.float32],
+        shape_material: wp.array[wp.int32],
+        variant_material: wp.array[wp.int32],
+        shape_variant: wp.array[wp.int32],
+        materials: wp.array[RayOpacity],
         ray_origin: wp.array[wp.vec3],
         ray_direction: wp.array[wp.vec3],
         ray_world: wp.array[wp.int32],
+        ray_enabled: wp.array[wp.bool],
         out_dist: wp.array[float],
         out_shape_id: wp.array[wp.int32],
         out_normal: wp.array[wp.vec3],
+        out_truncated: wp.array[wp.int32],
     ):
         rayid = wp.tid()
+        if wp.static(has_ray_mask):
+            if not ray_enabled[rayid]:
+                if wp.static(write_dist):
+                    out_dist[rayid] = -1.0
+                if wp.static(write_shape_id):
+                    out_shape_id[rayid] = -1
+                if wp.static(write_normal):
+                    out_normal[rayid] = wp.vec3(0.0)
+                if wp.static(write_truncated):
+                    out_truncated[rayid] = 0
+                return
 
         origin = ray_origin[rayid]
         direction = ray_direction[rayid]
@@ -1011,6 +1057,8 @@ def intersect_ray(
         min_dist = float(MAXVAL)
         min_shape_id = wp.int32(-1)
         min_normal = wp.vec3(0.0)
+        rejected = wp.int32(0)
+        truncated = wp.bool(False)
 
         # Pass 0 queries the ray's own world; pass 1 the global world shared by all.
         for i in range(wp.static(2 if enable_global_world else 1)):
@@ -1034,14 +1082,42 @@ def intersect_ray(
                     ray_origin_local, ray_direction_local = map_ray_to_local(
                         geom_to_world, origin, direction, shape_scale[shape_id]
                     )
-                    hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
-                        ray_origin_local,
-                        ray_direction_local,
-                        shape_scale[shape_id],
-                        shape_source_ptr[shape_id],
-                        False,
-                        min_dist,
-                    )
+                    if wp.static(has_cutouts):
+                        material_id = material_index(shape_id, shape_material, variant_material, shape_variant)
+                        if material_id >= 0:
+                            hit_dist, hit_normal_local, _u, _v, _face, count, exhausted = ray_intersect_mesh_cutout(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_scale[shape_id],
+                                shape_source_ptr[shape_id],
+                                False,
+                                min_dist,
+                                materials[material_id],
+                                shape_opacity[shape_id],
+                                wp.int32(wp.static(max_alpha_rejections)) - rejected,
+                            )
+                            rejected += count
+                            if exhausted:
+                                truncated = True
+                                break
+                        else:
+                            hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_scale[shape_id],
+                                shape_source_ptr[shape_id],
+                                False,
+                                min_dist,
+                            )
+                    else:
+                        hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
+                            ray_origin_local,
+                            ray_direction_local,
+                            shape_scale[shape_id],
+                            shape_source_ptr[shape_id],
+                            False,
+                            min_dist,
+                        )
                     hit_normal = wp.vec3(0.0)
                     if hit_dist >= 0.0:
                         hit_normal = wp.normalize(wp.transform_vector(geom_to_world, hit_normal_local))
@@ -1058,6 +1134,12 @@ def intersect_ray(
                     min_dist = hit_dist
                     min_shape_id = shape_id
                     min_normal = hit_normal
+            if truncated:
+                break
+
+        if truncated:
+            min_shape_id = -1
+            min_normal = wp.vec3(0.0)
 
         if wp.static(write_dist):
             out_dist[rayid] = wp.where(min_shape_id < 0, -1.0, min_dist)
@@ -1065,6 +1147,8 @@ def intersect_ray(
             out_shape_id[rayid] = min_shape_id
         if wp.static(write_normal):
             out_normal[rayid] = min_normal
+        if wp.static(write_truncated):
+            out_truncated[rayid] = wp.int32(truncated)
 
     wp.launch(
         kernel=_intersect_ray_kernel,
@@ -1077,14 +1161,21 @@ def intersect_ray(
             model.shape_type,
             model.shape_scale,
             model.shape_source_ptr,
+            model.shape_opacity,
+            cutouts.shapes if has_cutouts else None,
+            cutouts.variants if has_cutouts else None,
+            model._shape_variant_shape,
+            cutouts.materials if has_cutouts else None,
             ray_origins,
             ray_directions,
             ray_worlds,
+            ray_enabled,
         ],
         outputs=[
             out_dist,
             out_shape_id,
             out_normal,
+            out_truncated,
         ],
         device=model.device,
     )

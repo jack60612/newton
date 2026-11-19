@@ -12,6 +12,7 @@ import warp as wp
 from ...core import Axis
 from ...geometry import GeoType, Mesh
 from ...geometry.deformable_visual import DeformableVisualMesh, DeformableVisuals, _DeformableVisualSkinBatches
+from ...geometry.ray_opacity import RayOpacityView
 from ...sim import Model, State
 from ...utils import load_texture, normalize_texture
 from .render import create_kernel
@@ -70,6 +71,7 @@ class RenderContext:
         has_particles: bool = False
         has_world_indices: bool = False
         has_triangle_mesh_textures: bool = False
+        has_cutouts: bool = False
         render_color: bool = False
         render_depth: bool = False
         render_forward_depth: bool = False
@@ -77,6 +79,7 @@ class RenderContext:
         render_normal: bool = False
         render_albedo: bool = False
         render_hdr_color: bool = False
+        render_alpha_truncated: bool = False
 
     DEFAULT_CLEAR_DATA = ClearData()
     DEFAULT_RENDER_CONFIG = RenderConfig()
@@ -107,6 +110,7 @@ class RenderContext:
         self._model = model
         self._deformable_surface_mode = deformable_surface_mode
         self._render_state = RenderContext.RenderState()
+        self._empty_opacity = RayOpacityView()
 
         self._kernel_cache: dict[tuple, wp.Kernel] = {}
 
@@ -462,6 +466,7 @@ class RenderContext:
         shape_index_image: wp.array3d[wp.uint32] | None = None,
         normal_image: wp.array3d[wp.vec3f] | None = None,
         albedo_image: wp.array3d[wp.uint32] | None = None,
+        alpha_truncated_image: wp.array3d[wp.int32] | None = None,
         clear_data: ClearData | None = DEFAULT_CLEAR_DATA,
         config: RenderConfig | None = DEFAULT_RENDER_CONFIG,
     ):
@@ -500,6 +505,7 @@ class RenderContext:
             shape_index_image: Output shape-index buffer.
             normal_image: Output world-space surface normals.
             albedo_image: Output albedo buffer (packed ``uint32``).
+            alpha_truncated_image: Optional ``int32`` per-pixel truncation diagnostics.
             clear_data: Values used to clear output images before
                 rendering. Pass ``None`` to use :attr:`DEFAULT_CLEAR_DATA`.
             hdr_color_image: Output linear HDR color buffer.
@@ -509,6 +515,12 @@ class RenderContext:
         model = self.model
         if config is None:
             config = RenderContext.DEFAULT_RENDER_CONFIG
+        if (
+            isinstance(config.max_alpha_rejections, bool)
+            or not isinstance(config.max_alpha_rejections, (int, np.integer))
+            or not 0 <= config.max_alpha_rejections <= 0x7FFFFFFF
+        ):
+            raise ValueError("max_alpha_rejections must be a nonnegative int32")
         try:
             anti_aliasing = AntiAliasing(config.anti_aliasing)
         except (TypeError, ValueError) as exc:
@@ -523,6 +535,18 @@ class RenderContext:
             )
 
         has_shapes = model.bvh_shape_count_enabled > 0
+        cutouts = model._ray_opacity
+        self._render_state.has_cutouts = cutouts is not None and cutouts.has_cutouts
+        if self._render_state.has_cutouts and alpha_truncated_image is None:
+            raise ValueError("alpha_truncated_image is required when rendering cutout materials")
+        if alpha_truncated_image is not None:
+            if not isinstance(alpha_truncated_image, wp.array) or alpha_truncated_image.dtype != wp.int32:
+                raise ValueError("alpha_truncated_image must be an int32 Warp array")
+            if alpha_truncated_image.device != wp.get_device(self.device):
+                raise ValueError("alpha_truncated_image must be on the model device")
+            expected_status = (camera_transforms.shape[0], camera_rays.shape[0], camera_rays.shape[1])
+            if alpha_truncated_image.shape != expected_status:
+                raise ValueError(f"alpha_truncated_image shape must be {expected_status}")
         if has_shapes and (model.bvh_shapes is None or model.bvh_shapes_group_roots is None):
             raise RuntimeError("Shape BVH is incomplete; rebuild it with model.bvh_build_shapes(state).")
 
@@ -554,6 +578,7 @@ class RenderContext:
             self._render_state.render_normal = normal_image is not None
             self._render_state.render_albedo = albedo_image is not None
             self._render_state.render_hdr_color = hdr_color_image is not None
+            self._render_state.render_alpha_truncated = alpha_truncated_image is not None
 
             # One view per camera transform; independent of the model world count.
             view_count = camera_transforms.shape[0]
@@ -607,6 +632,8 @@ class RenderContext:
                 albedo_image = albedo_image.reshape(total_pixels)
             if hdr_color_image is not None:
                 hdr_color_image = hdr_color_image.reshape(total_pixels)
+            if alpha_truncated_image is not None:
+                alpha_truncated_image = alpha_truncated_image.reshape(total_pixels)
 
             # Key the cache on the value tuple itself (dict hashes AND compares by
             # equality), so two configs that merely share a hash cannot collide onto
@@ -655,6 +682,7 @@ class RenderContext:
                     model.shape_color,
                     model.bvh_shape_world_transforms,
                     model.shape_source_ptr,
+                    cutouts.view if cutouts is not None else self._empty_opacity,
                     self._shape_texture_ids,
                     self._shape_mesh_data_ids,
                     # Particle BVH
@@ -693,10 +721,13 @@ class RenderContext:
                     normal_image,
                     albedo_image,
                     hdr_color_image,
+                    alpha_truncated_image,
                 ],
                 device=self.device,
                 block_dim=config.block_dim,
             )
+        elif alpha_truncated_image is not None:
+            alpha_truncated_image.zero_()
 
     @property
     def light_count(self) -> int:

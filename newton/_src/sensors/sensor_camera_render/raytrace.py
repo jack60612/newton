@@ -9,6 +9,13 @@ import warp as wp
 
 from ...geometry import Gaussian, GeoType, raycast
 from ...geometry.bvh import BVH_SHAPE_INACTIVE
+from ...geometry.ray_opacity import (
+    RayOpacity,
+    RayOpacityView,
+    material_index,
+    ray_intersect_mesh_cutout,
+    ray_intersect_mesh_cutout_no_normal,
+)
 from . import gaussians
 from .types import MeshData, RenderConfig
 
@@ -32,6 +39,8 @@ class ClosestHit:
     # Mesh face index, or particle index for particle hits.
     face_idx: wp.int32
     color: wp.vec3f
+    alpha_rejections: wp.int32
+    alpha_truncated: wp.bool
 
 
 @wp.func
@@ -72,6 +81,46 @@ def _ray_intersect_mesh_smooth(
 
 
 @wp.func
+def _ray_intersect_mesh_cutout_smooth(
+    transform: wp.transformf,
+    scale: wp.vec3f,
+    ray_origin: wp.vec3f,
+    ray_direction: wp.vec3f,
+    mesh_id: wp.uint64,
+    shape_mesh_data_id: wp.int32,
+    mesh_data: wp.array[MeshData],
+    enable_backface_culling: wp.bool,
+    max_t: wp.float32,
+    opacity: RayOpacity,
+    scalar_opacity: wp.float32,
+    max_rejections: wp.int32,
+) -> tuple[wp.float32, wp.vec3f, wp.float32, wp.float32, wp.int32, wp.int32, wp.bool]:
+    ray_origin_local, ray_direction_local = raycast.map_ray_to_local(transform, ray_origin, ray_direction, scale)
+    t, normal_local, u, v, face, rejected, truncated = ray_intersect_mesh_cutout(
+        ray_origin_local,
+        ray_direction_local,
+        scale,
+        mesh_id,
+        enable_backface_culling and opacity.double_sided == 0,
+        max_t,
+        opacity,
+        scalar_opacity,
+        max_rejections,
+    )
+    if t < 0.0:
+        return t, normal_local, u, v, face, rejected, truncated
+    if shape_mesh_data_id > -1:
+        normals = mesh_data[shape_mesh_data_id].normals
+        if normals.shape[0] > 0:
+            n0 = wp.mesh_get_index(mesh_id, face * 3)
+            n1 = wp.mesh_get_index(mesh_id, face * 3 + 1)
+            n2 = wp.mesh_get_index(mesh_id, face * 3 + 2)
+            vertex_normal = normals[n0] * u + normals[n1] * v + normals[n2] * (1.0 - u - v)
+            normal_local = raycast.safe_div_vec3(vertex_normal, scale)
+    return t, wp.normalize(wp.transform_vector(transform, normal_local)), u, v, face, rejected, truncated
+
+
+@wp.func
 def get_group_roots(group_roots: wp.array[wp.int32], world_index: wp.int32, want_global_world: wp.int32) -> wp.int32:
     if want_global_world != 0:
         return group_roots[group_roots.shape[0] - 1]
@@ -93,6 +142,7 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_mesh_data_ids: wp.array[wp.int32],
         mesh_data: wp.array[MeshData],
         gaussians_data: wp.array[Gaussian.Data],
@@ -130,17 +180,44 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
                     # Heightfields are triangulated meshes; RenderContext remaps
                     # HFIELD -> MESH, so this branch renders them too.
                     if shape_type == GeoType.MESH:
-                        hit_distance, hit_normal, hit_u, hit_v, hit_face_id = _ray_intersect_mesh_smooth(
-                            shape_transforms[si],
-                            shape_sizes[si],
-                            ray_origin_world,
-                            ray_dir_world,
-                            shape_source_ptr[si],
-                            shape_mesh_data_ids[si],
-                            mesh_data,
-                            wp.static(config.enable_backface_culling),
-                            closest_hit.distance,
-                        )
+                        cutout_id = wp.int32(-1)
+                        if wp.static(state.has_cutouts):
+                            cutout_id = material_index(
+                                wp.int32(si), opacity.shapes, opacity.variants, opacity.shape_variant
+                            )
+                        if cutout_id >= 0:
+                            hit_distance, hit_normal, hit_u, hit_v, hit_face_id, rejected, truncated = (
+                                _ray_intersect_mesh_cutout_smooth(
+                                    shape_transforms[si],
+                                    shape_sizes[si],
+                                    ray_origin_world,
+                                    ray_dir_world,
+                                    shape_source_ptr[si],
+                                    shape_mesh_data_ids[si],
+                                    mesh_data,
+                                    wp.static(config.enable_backface_culling),
+                                    closest_hit.distance,
+                                    opacity.materials[cutout_id],
+                                    opacity.shape_opacity[si],
+                                    wp.static(int(config.max_alpha_rejections)) - closest_hit.alpha_rejections,
+                                )
+                            )
+                            closest_hit.alpha_rejections = closest_hit.alpha_rejections + rejected
+                            if truncated:
+                                closest_hit.alpha_truncated = True
+                                return closest_hit
+                        else:
+                            hit_distance, hit_normal, hit_u, hit_v, hit_face_id = _ray_intersect_mesh_smooth(
+                                shape_transforms[si],
+                                shape_sizes[si],
+                                ray_origin_world,
+                                ray_dir_world,
+                                shape_source_ptr[si],
+                                shape_mesh_data_ids[si],
+                                mesh_data,
+                                wp.static(config.enable_backface_culling),
+                                closest_hit.distance,
+                            )
                     elif shape_type == GeoType.GAUSSIAN:
                         if num_gaussians_hit < wp.static(state.num_gaussians):
                             gaussians_hit[num_gaussians_hit] = si
@@ -296,6 +373,7 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_mesh_data_ids: wp.array[wp.int32],
         mesh_data: wp.array[MeshData],
         particles_position: wp.array[wp.vec3f],
@@ -312,6 +390,8 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
         closest_hit.distance = max_distance
         closest_hit.shape_index = NO_HIT_SHAPE_ID
         closest_hit.color = wp.vec3f(0.0)
+        closest_hit.alpha_rejections = 0
+        closest_hit.alpha_truncated = False
 
         closest_hit = closest_hit_triangle_mesh(
             closest_hit, triangle_mesh_id, triangle_mesh_group_roots, world_index, ray_origin_world, ray_dir_world
@@ -328,6 +408,7 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
             shape_sizes,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             shape_mesh_data_ids,
             mesh_data,
             gaussians_data,
@@ -335,6 +416,8 @@ def create_closest_hit_function(config: RenderConfig, state: RenderContext.Rende
             ray_dir_world,
             camera_forward,
         )
+        if closest_hit.alpha_truncated:
+            return closest_hit
 
         if wp.static(config.enable_particles) and wp.static(state.has_particles):
             closest_hit = closest_hit_particles(
@@ -370,6 +453,7 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_mesh_data_ids: wp.array[wp.int32],
         mesh_data: wp.array[MeshData],
         gaussians_data: wp.array[Gaussian.Data],
@@ -403,14 +487,37 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
                         ray_origin_local, ray_direction_local = raycast.map_ray_to_local(
                             shape_transforms[si], ray_origin_world, ray_dir_world, shape_sizes[si]
                         )
-                        hit_dist, _normal, _u, _v, _face = raycast.ray_intersect_mesh_no_normal(
-                            ray_origin_local,
-                            ray_direction_local,
-                            shape_sizes[si],
-                            shape_source_ptr[si],
-                            wp.static(config.enable_backface_culling),
-                            closest_hit.distance,
-                        )
+                        cutout_id = wp.int32(-1)
+                        if wp.static(state.has_cutouts):
+                            cutout_id = material_index(
+                                wp.int32(si), opacity.shapes, opacity.variants, opacity.shape_variant
+                            )
+                        if cutout_id >= 0:
+                            material = opacity.materials[cutout_id]
+                            hit_dist, _normal, _u, _v, _face, rejected, truncated = ray_intersect_mesh_cutout_no_normal(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_sizes[si],
+                                shape_source_ptr[si],
+                                wp.static(config.enable_backface_culling) and material.double_sided == 0,
+                                closest_hit.distance,
+                                material,
+                                opacity.shape_opacity[si],
+                                wp.static(int(config.max_alpha_rejections)) - closest_hit.alpha_rejections,
+                            )
+                            closest_hit.alpha_rejections = closest_hit.alpha_rejections + rejected
+                            if truncated:
+                                closest_hit.alpha_truncated = True
+                                return closest_hit
+                        else:
+                            hit_dist, _normal, _u, _v, _face = raycast.ray_intersect_mesh_no_normal(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_sizes[si],
+                                shape_source_ptr[si],
+                                wp.static(config.enable_backface_culling),
+                                closest_hit.distance,
+                            )
                     elif shape_type == GeoType.GAUSSIAN:
                         if num_gaussians_hit < wp.static(state.num_gaussians):
                             gaussians_hit[num_gaussians_hit] = si
@@ -538,6 +645,7 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_mesh_data_ids: wp.array[wp.int32],
         mesh_data: wp.array[MeshData],
         particles_position: wp.array[wp.vec3f],
@@ -553,6 +661,8 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
         closest_hit = ClosestHit()
         closest_hit.distance = max_distance
         closest_hit.shape_index = NO_HIT_SHAPE_ID
+        closest_hit.alpha_rejections = 0
+        closest_hit.alpha_truncated = False
 
         closest_hit = closest_hit_triangle_mesh_depth_only(
             closest_hit, triangle_mesh_id, triangle_mesh_group_roots, world_index, ray_origin_world, ray_dir_world
@@ -569,6 +679,7 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
             shape_sizes,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             shape_mesh_data_ids,
             mesh_data,
             gaussians_data,
@@ -576,6 +687,8 @@ def create_closest_hit_depth_only_function(config: RenderConfig, state: RenderCo
             ray_dir_world,
             camera_forward,
         )
+        if closest_hit.alpha_truncated:
+            return closest_hit
 
         if wp.static(config.enable_particles) and wp.static(state.has_particles):
             closest_hit = closest_hit_particles_depth_only(
@@ -608,11 +721,13 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         ray_origin_world: wp.vec3f,
         ray_dir_world: wp.vec3f,
         max_dist: wp.float32,
-    ) -> wp.bool:
+    ) -> tuple[wp.bool, wp.bool]:
         if bvh_shapes_size:
+            rejected_total = wp.int32(0)
             for i in range(int(wp.static(2 if config.enable_global_world else 1))):
                 group_root = get_group_roots(bvh_shapes_group_roots, world_index, i)
                 if group_root < 0:
@@ -635,12 +750,33 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
                         ray_origin_local, ray_direction_local = raycast.map_ray_to_local(
                             shape_transforms[si], ray_origin_world, ray_dir_world, shape_sizes[si]
                         )
-                        hit_dist = raycast.ray_intersect_mesh_anyhit(
-                            ray_origin_local,
-                            ray_direction_local,
-                            shape_source_ptr[si],
-                            max_dist,
-                        )
+                        cutout_id = wp.int32(-1)
+                        if wp.static(state.has_cutouts):
+                            cutout_id = material_index(
+                                wp.int32(si), opacity.shapes, opacity.variants, opacity.shape_variant
+                            )
+                        if cutout_id >= 0:
+                            hit_dist, _normal, _u, _v, _face, rejected, truncated = ray_intersect_mesh_cutout_no_normal(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_sizes[si],
+                                shape_source_ptr[si],
+                                False,
+                                max_dist,
+                                opacity.materials[cutout_id],
+                                opacity.shape_opacity[si],
+                                wp.static(int(config.max_alpha_rejections)) - rejected_total,
+                            )
+                            rejected_total += rejected
+                            if truncated:
+                                return False, True
+                        else:
+                            hit_dist = raycast.ray_intersect_mesh_anyhit(
+                                ray_origin_local,
+                                ray_direction_local,
+                                shape_source_ptr[si],
+                                max_dist,
+                            )
                     else:
                         hit_dist, _normal = raycast.ray_intersect_shape_no_normal(
                             shape_transforms[si],
@@ -651,9 +787,9 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
                             wp.static(config.enable_backface_culling),
                         )
                     if hit_dist > -1 and hit_dist < max_dist:
-                        return True
+                        return True, False
 
-        return False
+        return False, False
 
     @wp.func
     def first_hit_particles(
@@ -735,6 +871,7 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         particles_position: wp.array[wp.vec3f],
         particles_radius: wp.array[wp.float32],
         topology_particle_mask: wp.array[wp.bool],
@@ -743,13 +880,13 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
         ray_origin_world: wp.vec3f,
         ray_dir_world: wp.vec3f,
         max_distance: wp.float32,
-    ) -> wp.bool:
+    ) -> tuple[wp.bool, wp.bool]:
         if first_hit_triangle_mesh(
             triangle_mesh_id, triangle_mesh_group_roots, world_index, ray_origin_world, ray_dir_world, max_distance
         ):
-            return True
+            return True, False
 
-        if first_hit_shape(
+        shape_hit, truncated = first_hit_shape(
             bvh_shapes_size,
             bvh_shapes_id,
             bvh_shapes_group_roots,
@@ -759,11 +896,15 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
             shape_sizes,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             ray_origin_world,
             ray_dir_world,
             max_distance,
-        ):
-            return True
+        )
+        if truncated:
+            return False, True
+        if shape_hit:
+            return True, False
 
         if wp.static(config.enable_particles) and wp.static(state.has_particles):
             if first_hit_particles(
@@ -778,8 +919,8 @@ def create_first_hit_function(config: RenderConfig, state: RenderContext.RenderS
                 ray_dir_world,
                 max_distance,
             ):
-                return True
+                return True, False
 
-        return False
+        return False, False
 
     return first_hit

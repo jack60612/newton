@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import warp as wp
 
 from ...core import MAXVAL
+from ...geometry.ray_opacity import RayOpacityView
 from . import raytrace
 from .types import RenderConfig
 
@@ -32,6 +33,7 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         light_active: wp.bool,
         light_type: wp.int32,
         light_cast_shadow: wp.bool,
@@ -44,11 +46,11 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
         triangle_mesh_group_roots: wp.array[wp.int32],
         normal: wp.vec3f,
         hit_point: wp.vec3f,
-    ) -> wp.float32:
+    ) -> tuple[wp.float32, wp.bool]:
         light_contribution = wp.float32(0.0)
 
         if not light_active:
-            return light_contribution
+            return light_contribution, False
 
         L = wp.vec3f(0.0, 0.0, 0.0)
         dist_to_light = wp.float32(MAXVAL)
@@ -72,7 +74,7 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
         ndotl = wp.max(0.0, wp.dot(normal, L))
 
         if ndotl == 0.0:
-            return light_contribution
+            return light_contribution, False
 
         visible = wp.float32(1.0)
         shadow_min_visibility = wp.float32(0.3)  # reduce shadow darkness (0: full black, 1: no shadow)
@@ -87,7 +89,7 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
             if light_type == 1:  # directional light
                 max_t = wp.float32(1.0e8)
 
-            shadow_hit = raytrace_first_hit(
+            shadow_hit, truncated = raytrace_first_hit(
                 bvh_shapes_size,
                 bvh_shapes_id,
                 bvh_shapes_group_roots,
@@ -100,6 +102,7 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
                 shape_sizes,
                 shape_transforms,
                 shape_source_ptr,
+                opacity,
                 particles_position,
                 particles_radius,
                 topology_particle_mask,
@@ -109,10 +112,12 @@ def create_compute_lighting_function(config: RenderConfig, state: RenderContext.
                 L,
                 max_t,
             )
+            if truncated:
+                return light_contribution, True
 
             if shadow_hit:
                 visible = shadow_min_visibility
 
-        return ndotl * attenuation * visible
+        return ndotl * attenuation * visible, False
 
     return compute_lighting

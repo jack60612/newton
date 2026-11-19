@@ -30,6 +30,7 @@ from ..utils.import_usd_deformable_utils import (
 from ..utils.texture import linear_texture_to_srgb, load_texture
 from ._mesh_loading import (  # noqa: F401
     _get_mesh_from_source,
+    _uvtexture_reader_varname,
     corner_angles,
     fan_triangulate_faces,
     get_mesh,
@@ -2032,6 +2033,9 @@ def _empty_material_properties() -> dict[str, Any]:
     return {
         "color": None,
         "opacity": None,
+        "opacity_threshold": None,
+        "opacity_texture": None,
+        "opacity_uv_primvar": None,
         "metallic": None,
         "roughness": None,
         "texture": None,
@@ -2189,6 +2193,12 @@ def _extract_preview_surface_properties(shader: UsdShade.Shader | None, prim: Us
     shader_id = shader.GetIdAttr().Get()
     if shader_id != "UsdPreviewSurface":
         return properties
+    threshold_input = shader.GetInput("opacityThreshold")
+    threshold_value = _get_input_value(shader, ("opacityThreshold",))
+    if threshold_input and threshold_input.HasConnectedSource() and threshold_value is None:
+        raise ValueError(f"Unsupported connected opacity threshold on {prim.GetPath()}.")
+    properties["opacity_threshold"] = _coerce_opacity(threshold_value)
+    cutout_enabled = (properties["opacity_threshold"] or 0.0) > 0.0
 
     color_input = shader.GetInput("baseColor") or shader.GetInput("diffuseColor")
     if color_input:
@@ -2232,8 +2242,59 @@ def _extract_preview_surface_properties(shader: UsdShade.Shader | None, prim: Us
         if has_opacity_source:
             source = opacity_input.GetConnectedSource()
             source_shader = UsdShade.Shader(source[0].GetPrim()) if source else None
-            opacity_value = _get_input_value(source_shader, ("opacity", "alpha", "opacity_constant", "alpha_constant"))
-            properties["opacity"] = _coerce_opacity(opacity_value)
+            if source_shader and source_shader.GetIdAttr().Get() == "UsdUVTexture":
+                if str(source[1]) != "a":
+                    if cutout_enabled:
+                        raise ValueError(
+                            f"Opacity cutout on {prim.GetPath()} requires the UsdUVTexture alpha output, "
+                            f"not {source[1]}."
+                        )
+                else:
+                    uv_name = _uvtexture_reader_varname(source_shader, strict=cutout_enabled)
+                    properties["opacity_uv_primvar"] = uv_name
+                    color_source = color_input.GetConnectedSource() if color_input else None
+                    color_shader = UsdShade.Shader(color_source[0].GetPrim()) if color_source else None
+                    if cutout_enabled:
+                        if uv_name is None:
+                            raise ValueError(f"Opacity texture on {prim.GetPath()} has no UV primvar reader.")
+                        for name in ("wrapS", "wrapT"):
+                            wrap = source_shader.GetInput(name)
+                            if not wrap or wrap.Get() != "repeat":
+                                raise ValueError(f"Opacity texture on {prim.GetPath()} requires repeat {name}.")
+                        for name, default in (("scale", 1.0), ("bias", 0.0)):
+                            parameter = source_shader.GetInput(name)
+                            if parameter and parameter.HasConnectedSource():
+                                raise ValueError(f"Opacity texture on {prim.GetPath()} uses connected alpha {name}.")
+                            value = _get_input_value(source_shader, (name,))
+                            if value is not None and float(value[3]) != default:
+                                raise ValueError(f"Opacity texture on {prim.GetPath()} uses unsupported alpha {name}.")
+                        if properties["texture"] is not None and color_shader:
+                            color_uv = _uvtexture_reader_varname(color_shader)
+                            color_transform = _extract_usd_transform2d(color_shader)
+                            opacity_transform = _extract_usd_transform2d(source_shader)
+                            identity = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0))
+                            if color_uv != uv_name or (color_transform or identity) != (opacity_transform or identity):
+                                raise ValueError(
+                                    f"Color and opacity textures on {prim.GetPath()} must use the same UVs and transform."
+                                )
+                    if color_shader and color_shader.GetPrim().GetPath() == source_shader.GetPrim().GetPath():
+                        properties["opacity_texture"] = properties["texture"]
+                    else:
+                        properties["opacity_texture"] = _find_texture_in_shader(source_shader, prim)
+                    if cutout_enabled and properties["opacity_texture"] is None:
+                        raise ValueError(f"Opacity texture on {prim.GetPath()} has no resolvable image.")
+                    if properties["texture"] is None:
+                        properties["texture_transform"] = _extract_usd_transform2d(source_shader)
+                    if cutout_enabled:
+                        # A connected opacity replaces the shader input's scalar fallback.
+                        properties["opacity"] = 1.0
+            elif cutout_enabled:
+                raise ValueError(f"Unsupported opacity cutout source on {prim.GetPath()}.")
+            if properties["opacity"] is None:
+                opacity_value = _get_input_value(
+                    source_shader, ("opacity", "alpha", "opacity_constant", "alpha_constant")
+                )
+                properties["opacity"] = _coerce_opacity(opacity_value)
         else:
             properties["opacity"] = _coerce_opacity(opacity_input.Get())
 

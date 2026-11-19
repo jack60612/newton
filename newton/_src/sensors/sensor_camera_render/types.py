@@ -187,6 +187,14 @@ class RenderConfig:
     max_distance: float = 1000.0
     """Maximum ray distance [m]."""
 
+    max_alpha_rejections: int = 8
+    """Maximum transparent or culled triangle rejections per primary or shadow ray.
+
+    If another candidate must be rejected after this budget is spent, the
+    affected pixel is cleared and marked in
+    :attr:`~newton.sensors.SensorCamera.alpha_truncated_image`.
+    """
+
     gaussians_mode: GaussianRenderMode = GaussianRenderMode.FAST
     """Gaussian splatting render mode (see :class:`GaussianRenderMode`)."""
 

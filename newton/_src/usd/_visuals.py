@@ -17,11 +17,22 @@ import warp as wp
 from ..core.types import Axis
 from ..geometry import Mesh
 from . import utils as usd
+from ._mesh_loading import _validate_cutout_uvs
 
 if TYPE_CHECKING:
     from pxr import Usd
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_cutout_mesh_uvs(mesh: Mesh, material_props: dict[str, Any], path: str) -> None:
+    """Ensure UV expansion produced data addressable by every triangle vertex."""
+    if (
+        (material_props.get("opacity_threshold") or 0.0) > 0.0
+        and material_props.get("opacity_texture") is not None
+        and (mesh.uvs is None or len(mesh.uvs) != len(mesh.vertices))
+    ):
+        raise ValueError(f"Opacity texture on {path} requires per-vertex UVs for every mesh vertex.")
 
 
 class _UsdVisuals:
@@ -67,7 +78,7 @@ class _UsdVisuals:
         elif material_props.get("color") is not None:
             mesh.color = material_props["color"]
 
-        for key in ("opacity", "roughness", "metallic", "texture_transform"):
+        for key in ("opacity", "opacity_threshold", "opacity_texture", "roughness", "metallic", "texture_transform"):
             value = material_props.get(key)
             if value is not None:
                 setattr(mesh, key, value)
@@ -76,11 +87,13 @@ class _UsdVisuals:
         """Load a renderable mesh without changing physics mass properties."""
         material_props = self.get_material_props_cached(prim)
         texture = material_props.get("texture")
+        _validate_cutout_uvs(prim, material_props)
         mesh = self.get_mesh_cached(
             prim,
-            load_uvs=texture is not None,
+            load_uvs=texture is not None or material_props.get("opacity_texture") is not None,
             load_normals=True,
         ).copy(recompute_inertia=False)
+        _validate_cutout_mesh_uvs(mesh, material_props, path_name)
         self.apply_visual_material(mesh, material_props)
         if mesh.texture is not None and mesh.uvs is None:
             logger.debug("Mesh %s has a texture but no UV coordinates; texture sampling is disabled.", path_name)
@@ -171,7 +184,7 @@ class _UsdVisuals:
         uvs = None
         if mesh.uvs is not None and len(mesh.uvs) == len(mesh.vertices):
             uvs = mesh.uvs[used_vertices]
-        elif material_props.get("texture") is not None:
+        elif material_props.get("texture") is not None or material_props.get("opacity_texture") is not None:
             uvs = self.get_subset_uvs(prim, used_vertices, len(used_vertices))
 
         submesh = Mesh(
@@ -182,6 +195,7 @@ class _UsdVisuals:
             compute_inertia=False,
             is_solid=mesh.is_solid,
             maxhullvert=mesh.maxhullvert,
+            double_sided=mesh.double_sided,
         )
 
         self.apply_visual_material(submesh, material_props)
@@ -209,11 +223,15 @@ class _UsdVisuals:
             return []
 
         subset_props = [(str(subset.GetPath()), usd.resolve_material_properties_for_prim(subset)) for subset in subsets]
+        for _, material_props in subset_props:
+            _validate_cutout_uvs(prim, material_props)
         # Load UVs (and matching authored normals) so each submesh slices real
         # per-corner texture coordinates instead of recovering per-vertex UVs,
         # which scrambles faceVarying UV sets. UV loading unwelds vertices while
         # preserving triangle order, so the per-face subset selection still aligns.
         mesh = self.get_mesh_cached(prim, load_uvs=True, load_normals=True)
+        for subset_path, material_props in subset_props:
+            _validate_cutout_mesh_uvs(mesh, material_props, subset_path)
         triangle_face_indices = np.repeat(np.arange(len(face_counts), dtype=np.int32), face_counts - 2)
         covered_faces = np.zeros(len(face_counts), dtype=bool)
 
@@ -265,10 +283,13 @@ class _UsdVisuals:
             face_mask = np.zeros(len(face_counts), dtype=bool)
             face_mask[uncovered_faces] = True
             triangle_indices = np.nonzero(face_mask[triangle_face_indices])[0]
+            material_props = self.get_material_props_cached(prim)
+            _validate_cutout_uvs(prim, material_props)
+            _validate_cutout_mesh_uvs(mesh, material_props, str(prim.GetPath()))
             fallback_mesh = self.make_visual_submesh(
                 mesh,
                 triangle_indices,
-                self.get_material_props_cached(prim),
+                material_props,
                 prim=prim,
                 path_name=str(prim.GetPath()),
             )

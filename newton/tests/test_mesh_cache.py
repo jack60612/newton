@@ -74,6 +74,55 @@ class TestMeshCache(unittest.TestCase):
             self.assertNotEqual(mesh._get_render_hash(), render_hash)
             self.assertEqual(hash(mesh), physics_hash)
 
+    def test_cutout_material_copy_and_render_identity(self):
+        """Copy alpha data independently and distinguish cutout render materials."""
+        pixels = np.full((32, 32, 4), 255, dtype=np.uint8)
+        pixels[7, 9, 3] = 0
+        mesh = Mesh(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0]],
+            [0, 1, 2],
+            uvs=[[0, 0], [1, 0], [0, 1]],
+            texture=pixels,
+            opacity_texture=pixels,
+            opacity_threshold=0.5,
+            double_sided=True,
+            compute_inertia=False,
+        )
+        physics_hash = hash(mesh)
+        copied = mesh.copy()
+        self.assertEqual(copied.opacity_threshold, 0.5)
+        self.assertTrue(copied.double_sided)
+        self.assertIs(copied.texture, copied.opacity_texture)
+        self.assertIsNot(copied.opacity_texture, mesh.opacity_texture)
+        np.testing.assert_array_equal(copied.opacity_texture, pixels)
+        self.assertEqual(copied._get_render_hash(), mesh._get_render_hash())
+
+        for attribute, value in (
+            ("opacity_threshold", 0.25),
+            ("double_sided", False),
+            ("texture_transform", ((2.0, 0.0, 0.0), (0.0, 1.0, 0.0))),
+        ):
+            changed = mesh.copy()
+            setattr(changed, attribute, value)
+            self.assertNotEqual(changed._get_render_hash(), mesh._get_render_hash())
+            self.assertEqual(hash(changed), physics_hash)
+
+        changed = mesh.copy()
+        changed.opacity_texture[7, 9, 3] = 255
+        changed.opacity_texture = changed.opacity_texture
+        self.assertNotEqual(changed.opacity_texture_hash, mesh.opacity_texture_hash)
+        self.assertNotEqual(changed._get_render_hash(), mesh._get_render_hash())
+
+        opaque = _make_tet_mesh()
+        self.assertIsNone(opaque.opacity_texture)
+        self.assertIsNone(opaque.opacity_threshold)
+        self.assertFalse(opaque.double_sided)
+        opaque.opacity_threshold = 0.0
+        self.assertEqual(opaque.opacity_threshold, 0.0)
+        for invalid in (-0.1, 1.1, float("nan"), float("inf")):
+            with self.assertRaises(ValueError):
+                opaque.opacity_threshold = invalid
+
 
 def test_finalize_reuses_cached_mesh(test: TestMeshCache, device):
     """Verify finalize() reuses the cached Warp mesh only for identical arguments.

@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import warp as wp
 
 from ...geometry import Gaussian, GeoType
+from ...geometry.ray_opacity import RayOpacityView
 from ...utils.color import ColorSpace, color_srgb_to_linear, linear_to_srgb_wp, srgb_to_linear_wp
 from . import lighting, raytrace, textures, tiling
 from .types import AntiAliasing, ClearData, MeshData, RenderConfig, RenderOrder, TextureData, WorldRenderFlag
@@ -24,6 +25,7 @@ class RenderSample:
     """Outputs produced by tracing and shading one camera ray."""
 
     hit: wp.bool
+    alpha_truncated: wp.bool
     distance: wp.float32
     forward_depth: wp.float32
     shape_index: wp.uint32
@@ -42,6 +44,7 @@ class TraceResult:
     """
 
     hit: wp.bool
+    alpha_truncated: wp.bool
     forward_depth: wp.float32
     ray_origin_world: wp.vec3f
     ray_dir_world: wp.vec3f
@@ -54,6 +57,7 @@ class ShadeResult:
 
     albedo: wp.vec3f
     color: wp.vec3f
+    alpha_truncated: wp.bool
 
 
 def _srgb_packed_rgba_to_linear(packed: int) -> int:
@@ -148,6 +152,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         shape_sizes: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_mesh_data_ids: wp.array[wp.int32],
         bvh_particles_size: wp.int32,
         bvh_particles_id: wp.uint64,
@@ -162,6 +167,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
     ) -> TraceResult:
         result = TraceResult()
         result.hit = wp.bool(False)
+        result.alpha_truncated = wp.bool(False)
         result.forward_depth = wp.float32(0.0)
 
         ray_origin_world = wp.transform_point(camera_transform, camera_ray_origin)
@@ -185,6 +191,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             shape_sizes,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             shape_mesh_data_ids,
             mesh_data,
             particles_position,
@@ -198,6 +205,9 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             camera_forward,
         )
         result.closest_hit = closest_hit
+        result.alpha_truncated = closest_hit.alpha_truncated
+        if result.alpha_truncated:
+            return result
         if closest_hit.shape_index == raytrace.NO_HIT_SHAPE_ID:
             return result
 
@@ -223,6 +233,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         shape_colors: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_texture_ids: wp.array[wp.int32],
         shape_mesh_data_ids: wp.array[wp.int32],
         bvh_particles_size: wp.int32,
@@ -249,6 +260,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         result = ShadeResult()
         result.albedo = wp.vec3f(0.0)
         result.color = wp.vec3f(0.0)
+        result.alpha_truncated = wp.bool(False)
 
         closest_hit = trace.closest_hit
         is_gaussian = wp.bool(False)
@@ -321,7 +333,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 shaded_color = wp.cw_mul(albedo_color, ambient_color)
 
             for light_index in range(light_count):
-                light_contribution = compute_lighting(
+                light_contribution, truncated = compute_lighting(
                     world_index,
                     bvh_shapes_size,
                     bvh_shapes_id,
@@ -334,6 +346,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     shape_sizes,
                     shape_transforms,
                     shape_source_ptr,
+                    opacity,
                     light_active[light_index],
                     light_type[light_index],
                     light_cast_shadow[light_index],
@@ -347,6 +360,9 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     closest_hit.normal,
                     hit_point,
                 )
+                if truncated:
+                    result.alpha_truncated = wp.bool(True)
+                    return result
                 shaded_color = shaded_color + wp.cw_mul(albedo_color, light_colors[light_index]) * light_contribution
 
         result.color = shaded_color
@@ -370,6 +386,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         shape_colors: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_texture_ids: wp.array[wp.int32],
         shape_mesh_data_ids: wp.array[wp.int32],
         bvh_particles_size: wp.int32,
@@ -396,6 +413,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
     ) -> RenderSample:
         result = RenderSample()
         result.hit = wp.bool(False)
+        result.alpha_truncated = wp.bool(False)
         result.distance = wp.float32(0.0)
         result.forward_depth = wp.float32(0.0)
         result.shape_index = raytrace.NO_HIT_SHAPE_ID
@@ -418,6 +436,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             shape_sizes,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             shape_mesh_data_ids,
             bvh_particles_size,
             bvh_particles_id,
@@ -430,6 +449,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             mesh_data,
             gaussians_data,
         )
+        result.alpha_truncated = trace.alpha_truncated
         if not trace.hit:
             return result
 
@@ -460,6 +480,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             shape_colors,
             shape_transforms,
             shape_source_ptr,
+            opacity,
             shape_texture_ids,
             shape_mesh_data_ids,
             bvh_particles_size,
@@ -483,6 +504,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
             light_colors,
             ambient_lighting,
         )
+        result.alpha_truncated = shade.alpha_truncated
         result.albedo = shade.albedo
         result.color = shade.color
         return result
@@ -510,6 +532,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         shape_colors: wp.array[wp.vec3f],
         shape_transforms: wp.array[wp.transformf],
         shape_source_ptr: wp.array[wp.uint64],
+        opacity: RayOpacityView,
         shape_texture_ids: wp.array[wp.int32],
         shape_mesh_data_ids: wp.array[wp.int32],
         # Particle BVH
@@ -548,6 +571,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
         out_normal: wp.array[wp.vec3f],
         out_albedo: wp.array[wp.uint32],
         out_hdr_color: wp.array[wp.vec3f],
+        out_alpha_truncated: wp.array[wp.int32],
     ):
         tid = wp.tid()
 
@@ -567,6 +591,8 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
 
         pixels_per_view = img_width * img_height
         out_index = view_index * pixels_per_view + py * img_width + px
+        if wp.static(state.render_alpha_truncated):
+            out_alpha_truncated[out_index] = 0
 
         # With an explicit mapping, a valid entry is a world index in
         # ``[0, world_count)``. ``DISABLE_PRESERVE`` leaves the outputs untouched;
@@ -621,6 +647,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 shape_colors,
                 shape_transforms,
                 shape_source_ptr,
+                opacity,
                 shape_texture_ids,
                 shape_mesh_data_ids,
                 bvh_particles_size,
@@ -645,7 +672,9 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                 light_colors,
                 ambient_lighting,
             )
-            if not sample.hit:
+            if sample.alpha_truncated and wp.static(state.render_alpha_truncated):
+                out_alpha_truncated[out_index] = 1
+            if not sample.hit or sample.alpha_truncated:
                 write_clear_outputs(
                     out_index,
                     out_color,
@@ -724,6 +753,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     shape_colors,
                     shape_transforms,
                     shape_source_ptr,
+                    opacity,
                     shape_texture_ids,
                     shape_mesh_data_ids,
                     bvh_particles_size,
@@ -748,6 +778,20 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     light_colors,
                     ambient_lighting,
                 )
+                if sample.alpha_truncated:
+                    if wp.static(state.render_alpha_truncated):
+                        out_alpha_truncated[out_index] = 1
+                    write_clear_outputs(
+                        out_index,
+                        out_color,
+                        out_depth,
+                        out_forward_depth,
+                        out_shape_index,
+                        out_normal,
+                        out_albedo,
+                        out_hdr_color,
+                    )
+                    return
                 if not sample.hit:
                     if wp.static(state.render_color):
                         color_sum += clear_color
@@ -847,6 +891,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     shape_sizes,
                     shape_transforms,
                     shape_source_ptr,
+                    opacity,
                     shape_mesh_data_ids,
                     bvh_particles_size,
                     bvh_particles_id,
@@ -859,6 +904,20 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     mesh_data,
                     gaussians_data,
                 )
+                if trace.alpha_truncated:
+                    if wp.static(state.render_alpha_truncated):
+                        out_alpha_truncated[out_index] = 1
+                    write_clear_outputs(
+                        out_index,
+                        out_color,
+                        out_depth,
+                        out_forward_depth,
+                        out_shape_index,
+                        out_normal,
+                        out_albedo,
+                        out_hdr_color,
+                    )
+                    return
                 if not trace.hit:
                     miss_count += 1
                     continue
@@ -882,7 +941,11 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                     sample_albedo = wp.vec3f(0.0)
                     found = wp.bool(False)
                     # Sentinel shape IDs need a particle or face index to distinguish hits.
-                    if surface_id < raytrace.MAX_SHAPE_ID or shape_sub_index >= 0:
+                    # Different points on the same surface can cast shadow rays
+                    # through different cutouts; each must report exhaustion.
+                    if wp.static(not (state.has_cutouts and config.enable_shadows)) and (
+                        surface_id < raytrace.MAX_SHAPE_ID or shape_sub_index >= 0
+                    ):
                         for slot in range(_MSAA_SURFACE_SLOTS):
                             if (
                                 not found
@@ -909,6 +972,7 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                             shape_colors,
                             shape_transforms,
                             shape_source_ptr,
+                            opacity,
                             shape_texture_ids,
                             shape_mesh_data_ids,
                             bvh_particles_size,
@@ -932,9 +996,25 @@ def create_kernel(config: RenderConfig, state: RenderContext.RenderState, clear_
                             light_colors,
                             ambient_lighting,
                         )
+                        if shade.alpha_truncated:
+                            if wp.static(state.render_alpha_truncated):
+                                out_alpha_truncated[out_index] = 1
+                            write_clear_outputs(
+                                out_index,
+                                out_color,
+                                out_depth,
+                                out_forward_depth,
+                                out_shape_index,
+                                out_normal,
+                                out_albedo,
+                                out_hdr_color,
+                            )
+                            return
                         sample_color = shade.color
                         sample_albedo = shade.albedo
-                        if surface_id < raytrace.MAX_SHAPE_ID or shape_sub_index >= 0:
+                        if wp.static(not (state.has_cutouts and config.enable_shadows)) and (
+                            surface_id < raytrace.MAX_SHAPE_ID or shape_sub_index >= 0
+                        ):
                             inserted = wp.bool(False)
                             for slot in range(_MSAA_SURFACE_SLOTS):
                                 if not inserted and slot_shape[slot] == raytrace.NO_HIT_SHAPE_ID:

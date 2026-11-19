@@ -173,6 +173,12 @@ Similar to MJCF import, you can control whether sites and visual shapes are load
 
 By default, both ``load_sites`` and ``load_visual_shapes`` are set to ``True``.
 
+USD sites retain their site identity regardless of visibility. Their visible flag
+follows inherited USD visibility and viewport purpose: ``default`` and ``proxy``
+are drawn, while ``guide``, ``render``, and invisible sites are hidden. Hidden
+sites remain available as non-colliding, massless reference frames.
+
+
 Using Sites with Sensors
 ------------------------
 

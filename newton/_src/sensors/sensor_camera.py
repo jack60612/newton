@@ -182,6 +182,9 @@ class SensorCamera:
         )
         """Render settings used by :meth:`update` when its ``render_config`` argument is ``None``."""
 
+        self._alpha_truncated_image: wp.array3d[wp.int32] | None = None
+        self._owned_alpha_truncated_image: wp.array3d[wp.int32] | None = None
+
         from .sensor_camera_render.render_context import RenderContext  # noqa: PLC0415
 
         self._render_context = RenderContext(
@@ -194,6 +197,20 @@ class SensorCamera:
     def device(self) -> wp.Device:
         """Device of the model this sensor renders."""
         return self._render_context.model.device
+
+    @property
+    def alpha_truncated_image(self) -> wp.array3d[wp.int32] | None:
+        """Per-pixel alpha traversal status from the most recent render.
+
+        A value of ``1`` means a primary or shadow ray exhausted
+        :attr:`RenderConfig.max_alpha_rejections`; all requested outputs for
+        that pixel contain their clear values. A value of ``0`` means no ray
+        used for the pixel exhausted the budget. For SSAA and MSAA, any
+        truncated sample marks and clears the entire pixel. Disabled views
+        reset this diagnostic to zero, even when their other outputs are
+        preserved. The array is ``None`` before the first update.
+        """
+        return self._alpha_truncated_image
 
     def allocate_image(self, view_count: int, width: int, height: int, dtype: Any) -> wp.array[Any]:
         """Allocate a zeroed output image array on the model device.
@@ -997,6 +1014,7 @@ class SensorCamera:
         normal_image: wp.array3d[wp.vec3f] | None = None,
         albedo_image: wp.array3d[wp.uint32] | None = None,
         hdr_color_image: wp.array3d[wp.vec3f] | None = None,
+        alpha_truncated_image: wp.array3d[wp.int32] | None = None,
         world_indices: wp.array[wp.int32] | None = None,
         clear_data: ClearData | None = None,
         render_config: RenderConfig | None = None,
@@ -1038,6 +1056,12 @@ class SensorCamera:
             normal_image: Output world-space surface normals.
             albedo_image: Output albedo buffer (packed ``uint32``).
             hdr_color_image: Output linear HDR color buffer.
+            alpha_truncated_image: Optional caller-owned ``int32`` array of
+                shape ``(view_count, height, width)`` for truncation status.
+                Supply a preallocated array when capturing a CUDA graph. If
+                omitted, the camera allocates and reuses its own buffer;
+                the array used by the latest call is available through
+                :attr:`alpha_truncated_image`.
             world_indices: Optional per-view world selector, shape
                 ``(view_count,)``. Defaults to the identity mapping (view ``i``
                 renders world ``i``). A valid entry is a world index in
@@ -1101,6 +1125,19 @@ class SensorCamera:
                 "pass an explicit world_indices mapping for the extra views."
             )
 
+        status_shape = (view_count, int(camera_rays.shape[0]), int(camera_rays.shape[1]))
+        if alpha_truncated_image is None:
+            if self._owned_alpha_truncated_image is None or self._owned_alpha_truncated_image.shape != status_shape:
+                self._owned_alpha_truncated_image = wp.empty(status_shape, dtype=wp.int32, device=model.device)
+            alpha_truncated_image = self._owned_alpha_truncated_image
+        else:
+            self._validate_render_array("alpha_truncated_image", alpha_truncated_image, wp.int32, model.device)
+            if alpha_truncated_image.shape != status_shape:
+                raise ValueError(
+                    f"alpha_truncated_image must have shape {status_shape}, got {alpha_truncated_image.shape}."
+                )
+        self._alpha_truncated_image = alpha_truncated_image
+
         with wp.ScopedTimer("Newton::SensorCamera::update", active=PROFILE_ENABLED, use_nvtx=True, synchronize=True):
             render_context.render(
                 state,
@@ -1114,6 +1151,7 @@ class SensorCamera:
                 shape_index_image=shape_index_image,
                 normal_image=normal_image,
                 albedo_image=albedo_image,
+                alpha_truncated_image=alpha_truncated_image,
                 clear_data=clear_data if clear_data is not None else self.default_clear_data,
                 config=render_config if render_config is not None else self.default_render_config,
             )

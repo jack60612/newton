@@ -983,7 +983,9 @@ def parse_usd(
         shape_id = -1
 
         visual_shape_cfg_for_prim = copy.copy(visual_shape_cfg)
-        visual_shape_cfg_for_prim.is_visible = is_site or visuals.is_viewport_drawn(prim)
+        visual_shape_cfg_for_prim.is_visible = visuals.is_viewport_drawn(prim)
+        if is_site:
+            visual_shape_cfg_for_prim.mark_as_site()
         material_props = visuals.get_material_props_cached(prim)
         shape_color = material_props.get("color")
         shape_visual_kwargs = {}

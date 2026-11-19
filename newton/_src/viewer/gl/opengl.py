@@ -78,7 +78,7 @@ def check_gl_error():
         logger.error("OpenGL error: %s (%#x)\nCalled from: %s", error_name, error, "".join(stack[-2:-1]))
 
 
-def _upload_texture_from_file(gl, texture_image: np.ndarray) -> int:
+def _upload_texture_from_file(gl, texture_image: np.ndarray, *, mipmaps: bool = True) -> int:
     image = normalize_texture(
         texture_image,
         flip_vertical=True,
@@ -100,7 +100,8 @@ def _upload_texture_from_file(gl, texture_image: np.ndarray) -> int:
 
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_S, gl.GL_REPEAT)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_WRAP_T, gl.GL_REPEAT)
-    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, gl.GL_LINEAR_MIPMAP_LINEAR)
+    min_filter = gl.GL_LINEAR_MIPMAP_LINEAR if mipmaps else gl.GL_LINEAR
+    gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MIN_FILTER, min_filter)
     gl.glTexParameteri(gl.GL_TEXTURE_2D, gl.GL_TEXTURE_MAG_FILTER, gl.GL_LINEAR)
 
     format_enum = gl.GL_RGBA if channels == 4 else gl.GL_RGB
@@ -123,7 +124,8 @@ def _upload_texture_from_file(gl, texture_image: np.ndarray) -> int:
     )
     if prev_alignment is not None:
         gl.glPixelStorei(gl.GL_UNPACK_ALIGNMENT, prev_alignment.value)
-    gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
+    if mipmaps:
+        gl.glGenerateMipmap(gl.GL_TEXTURE_2D)
     gl.glBindTexture(gl.GL_TEXTURE_2D, 0)
     return texture_id
 
@@ -215,6 +217,10 @@ class MeshGL:
         self.normals = None  # scratch buffer used during normal recomputation
         self.texture_id = None
         self._texture_source = None
+        self._texture_has_alpha = False
+        self.opacity_texture_id = None
+        self._owns_opacity_texture = False
+        self.opacity_threshold = 0.0
         self.opacity = 1.0
         self._capsule_instancing = False
 
@@ -262,6 +268,7 @@ class MeshGL:
         gl.glDisableVertexAttribArray(7)
         gl.glDisableVertexAttribArray(8)
         gl.glDisableVertexAttribArray(9)
+        gl.glDisableVertexAttribArray(11)
 
         #   column 0  (1,0,0,0)
         gl.glVertexAttrib4f(3, 1.0, 0.0, 0.0, 0.0)
@@ -302,6 +309,10 @@ class MeshGL:
                 gl.glDeleteBuffers(1, self.vbo)
             if hasattr(self, "ebo"):
                 gl.glDeleteBuffers(1, self.ebo)
+            if self._owns_opacity_texture and self.opacity_texture_id is not None:
+                gl.glDeleteTextures(1, self.opacity_texture_id)
+                self.opacity_texture_id = None
+                self._owns_opacity_texture = False
             if hasattr(self, "texture_id") and self.texture_id is not None:
                 gl.glDeleteTextures(1, self.texture_id)
         except Exception:
@@ -416,6 +427,7 @@ class MeshGL:
                 except Exception:
                     pass
                 self.texture_id = None
+            self._texture_has_alpha = False
             self._texture_source = texture
             return
 
@@ -428,10 +440,50 @@ class MeshGL:
 
         self._texture_source = None
         texture_id = _upload_texture_from_file(gl, texture_image)
+        self._texture_has_alpha = texture_image.ndim == 3 and texture_image.shape[2] == 4
         if texture_id:
             self.texture_id = texture_id
         # Cache deterministic rejection, but leave exceptions retryable.
         self._texture_source = texture
+
+    def set_cutout(self, threshold, texture):
+        """Set the authored binary opacity mask for this mesh prototype."""
+        gl = RendererGL.gl
+        if self._owns_opacity_texture and self.opacity_texture_id is not None:
+            gl.glDeleteTextures(1, self.opacity_texture_id)
+        self.opacity_texture_id = None
+        self._owns_opacity_texture = False
+        self.opacity_threshold = 0.0 if threshold is None else float(threshold)
+        if self.opacity_threshold <= 0.0 or texture is None:
+            return
+
+        same_source = texture is self._texture_source or (
+            isinstance(texture, str) and isinstance(self._texture_source, str) and texture == self._texture_source
+        )
+        if same_source:
+            if self.texture_id is None or not self._texture_has_alpha:
+                raise ValueError("Opacity texture must be an available RGBA image")
+            self.opacity_texture_id = self.texture_id
+            return
+
+        from ...utils.texture import load_texture  # noqa: PLC0415
+
+        image = load_texture(texture)
+        if image is None or image.ndim != 3 or image.shape[2] != 4:
+            raise ValueError("Opacity texture must be an available RGBA image")
+        texture_id = _upload_texture_from_file(gl, image, mipmaps=False)
+        if not texture_id:
+            raise ValueError("Could not upload opacity texture")
+        self.opacity_texture_id = texture_id
+        self._owns_opacity_texture = True
+
+    def _bind_cutout(self):
+        gl = RendererGL.gl
+        gl.glVertexAttrib2f(11, self.opacity_threshold, float(self.opacity_texture_id is not None))
+        if self.opacity_texture_id is not None:
+            gl.glActiveTexture(gl.GL_TEXTURE3)
+            gl.glBindTexture(gl.GL_TEXTURE_2D, self.opacity_texture_id)
+            gl.glActiveTexture(gl.GL_TEXTURE1)
 
     def render(self):
         if not self.hidden:
@@ -453,14 +505,15 @@ class MeshGL:
             gl.glVertexAttrib4f(8, *self.material)
 
             gl.glBindVertexArray(self.vao)
+            self._bind_cutout()
             gl.glVertexAttrib1f(9, self.opacity)
             gl.glVertexAttrib1f(10, 0.0)
             gl.glDrawElements(gl.GL_TRIANGLES, self.num_indices, gl.GL_UNSIGNED_INT, None)
             gl.glBindVertexArray(0)
 
     def has_transparency(self) -> bool:
-        """Return True when this mesh needs transparent rendering."""
-        return not self.hidden and self.opacity < OPAQUE_OPACITY_THRESHOLD
+        """Return True when this mesh needs blended, rather than cutout, rendering."""
+        return not self.hidden and self.opacity_threshold <= 0.0 and self.opacity < OPAQUE_OPACITY_THRESHOLD
 
 
 class LinesGL:
@@ -868,6 +921,7 @@ class MeshInstancerGL:
         # Opaque instancers use the constant attribute. Allocate a buffer only
         # if a later update actually contains transparent instances.
         gl.glDisableVertexAttribArray(9)
+        gl.glDisableVertexAttribArray(11)
         gl.glVertexAttrib1f(9, 1.0)
 
         gl.glBindVertexArray(0)
@@ -1045,7 +1099,8 @@ class MeshInstancerGL:
         host_opacities = np.ascontiguousarray(opacities.numpy(), dtype=np.float32).reshape(-1)[:count]
         host_opacities = np.clip(host_opacities, 0.0, 1.0)
         self._has_transparency = bool(np.any(host_opacities < OPAQUE_OPACITY_THRESHOLD))
-        if not self._has_transparency:
+        scalar_cutout = self.mesh.opacity_threshold > 0.0 and self.mesh.opacity_texture_id is None
+        if not self._has_transparency and not (scalar_cutout and np.any(host_opacities != 1.0)):
             self._set_opacity_attribute_enabled(False)
             return
 
@@ -1083,8 +1138,13 @@ class MeshInstancerGL:
         self._opacity_attribute_enabled = enabled
 
     def has_transparency(self) -> bool:
-        """Return True when any active instance needs transparent rendering."""
-        return not self.hidden and self.active_instances > 0 and self._has_transparency
+        """Return True when any active instance needs blended rendering."""
+        return (
+            not self.hidden
+            and self.active_instances > 0
+            and self.mesh.opacity_threshold <= 0.0
+            and self._has_transparency
+        )
 
     def render(self):
         self._draw()
@@ -1107,6 +1167,9 @@ class MeshInstancerGL:
             gl.glBindTexture(gl.GL_TEXTURE_2D, RendererGL.get_fallback_texture())
 
         gl.glBindVertexArray(self.vao)
+        if not self._opacity_attribute_enabled:
+            gl.glVertexAttrib1f(9, 1.0)
+        self.mesh._bind_cutout()
         gl.glVertexAttrib1f(10, float(self.mesh._capsule_instancing))
         gl.glDrawElementsInstanced(
             gl.GL_TRIANGLES, self.mesh.num_indices, gl.GL_UNSIGNED_INT, None, self.active_instances
@@ -2182,8 +2245,7 @@ class RendererGL:
 
         self._shadow_shader.update(self._light_space_matrix, camera_pos)
 
-        # Render from the light's point of view. Transparent objects do not cast
-        # shadows because the shadow pass has no alpha-aware representation.
+        # Blended objects do not cast shadows; binary cutouts use the opaque pass.
         if scene_has_transparency:
             shadow_objects = {
                 k: v

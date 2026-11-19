@@ -4,6 +4,7 @@
 import builtins
 import contextlib
 import hashlib
+import importlib.util
 import inspect
 import logging
 import math
@@ -5686,6 +5687,239 @@ def Xform "Articulation" (
         self.assertIsNotNone(blue_mesh.uvs)
         self.assertEqual(blue_mesh.texture, "blue.png")
         np.testing.assert_allclose(np.array(blue_mesh.color), np.array([1.0, 1.0, 1.0]), atol=1e-6, rtol=1e-6)
+
+    @staticmethod
+    def _make_cutout_stage(texture_path, *, face_varying=False, connected=True, threshold=0.5, color=True):
+        """Build a PreviewSurface with a real RGBA asset and a non-default UV set."""
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        mesh = UsdGeom.Mesh.Define(stage, "/World/Leaf")
+        mesh.CreatePointsAttr().Set([(0, 0, 0), (1, 0, 0), (1, 1, 0), (0, 1, 0)])
+        mesh.CreateFaceVertexCountsAttr().Set([3, 3])
+        mesh.CreateFaceVertexIndicesAttr().Set([0, 1, 2, 0, 2, 3])
+        mesh.CreateDoubleSidedAttr().Set(True)
+        primvars = UsdGeom.PrimvarsAPI(mesh)
+        decoy = primvars.CreatePrimvar("st", Sdf.ValueTypeNames.TexCoord2fArray, UsdGeom.Tokens.vertex)
+        decoy.Set([(0, 0)] * 4)
+        interpolation = UsdGeom.Tokens.faceVarying if face_varying else UsdGeom.Tokens.vertex
+        uv = primvars.CreatePrimvar("st_leaf", Sdf.ValueTypeNames.TexCoord2fArray, interpolation)
+        uv_values = [(0, 0), (1, 0), (1, 1), (0, 1), (0.25, 0.25)]
+        uv.Set(uv_values if face_varying else uv_values[:4])
+        if face_varying:
+            uv.SetIndices([0, 1, 2, 4, 2, 3])
+
+        material = UsdShade.Material.Define(stage, "/Materials/Leaf")
+        surface = UsdShade.Shader.Define(stage, "/Materials/Leaf/Surface")
+        surface.CreateIdAttr("UsdPreviewSurface")
+        texture = UsdShade.Shader.Define(stage, "/Materials/Leaf/Texture")
+        texture.CreateIdAttr("UsdUVTexture")
+        texture.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath(texture_path))
+        texture.CreateInput("sourceColorSpace", Sdf.ValueTypeNames.Token).Set("sRGB")
+        texture.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+        texture.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+        texture.CreateOutput("rgb", Sdf.ValueTypeNames.Float3)
+        texture.CreateOutput("a", Sdf.ValueTypeNames.Float)
+        texture.CreateOutput("r", Sdf.ValueTypeNames.Float)
+        reader = UsdShade.Shader.Define(stage, "/Materials/Leaf/UV")
+        reader.CreateIdAttr("UsdPrimvarReader_float2")
+        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st_leaf")
+        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+        texture.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(reader.ConnectableAPI(), "result")
+        if color:
+            surface.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).ConnectToSource(
+                texture.ConnectableAPI(), "rgb"
+            )
+        opacity = surface.CreateInput("opacity", Sdf.ValueTypeNames.Float)
+        opacity.Set(0.25)
+        if connected:
+            opacity.ConnectToSource(texture.ConnectableAPI(), "a")
+        if threshold is not None:
+            surface.CreateInput("opacityThreshold", Sdf.ValueTypeNames.Float).Set(threshold)
+        material.CreateSurfaceOutput().ConnectToSource(surface.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(mesh.GetPrim()).Bind(material)
+        expected_corners = np.asarray(uv_values, dtype=np.float32)[[0, 1, 2, 4 if face_varying else 0, 2, 3]]
+        return stage, mesh, surface, texture, expected_corners
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "Requires Pillow")
+    def test_cutout_texture_uvs_and_world_copies(self):
+        """Import the actual alpha channel and preserve its mapping in all world copies."""
+        from PIL import Image
+
+        from newton._src.utils.texture import load_texture
+
+        pixels = np.array(
+            [[[30, 70, 90, 0], [30, 70, 90, 64]], [[30, 70, 90, 128], [30, 70, 90, 255]]],
+            dtype=np.uint8,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            texture_path = os.path.join(tmpdir, "leaf.png")
+            Image.fromarray(pixels).save(texture_path)
+            for face_varying in (False, True):
+                with self.subTest(face_varying=face_varying):
+                    stage, prim, _, _, expected_uvs = self._make_cutout_stage(texture_path, face_varying=face_varying)
+                    direct = usd.get_mesh(prim.GetPrim(), load_uvs=True, compute_inertia=False)
+                    merged = usd.get_mesh(stage, load_uvs=True, compute_inertia=False)
+                    for mesh in (direct, merged):
+                        self.assertEqual(mesh.opacity_threshold, 0.5)
+                        self.assertEqual(mesh.opacity, 1.0)
+                        self.assertTrue(mesh.double_sided)
+                        np.testing.assert_array_equal(load_texture(mesh.opacity_texture), pixels)
+                        np.testing.assert_allclose(mesh.uvs[mesh.indices], expected_uvs)
+
+                    source = newton.ModelBuilder()
+                    result = source.add_usd(stage)
+                    source_mesh = source.shape_source[result["path_shape_map"]["/World/Leaf"]]
+                    self.assertEqual(source_mesh.opacity_threshold, 0.5)
+                    self.assertEqual(source_mesh.opacity, 1.0)
+                    self.assertTrue(source_mesh.double_sided)
+                    np.testing.assert_array_equal(load_texture(source_mesh.opacity_texture), pixels)
+                    np.testing.assert_allclose(source_mesh.uvs[source_mesh.indices], expected_uvs)
+
+                    replicas = newton.ModelBuilder()
+                    replicas.replicate(source, copy_count=3)
+                    model = replicas.finalize(device="cpu")
+                    self.assertEqual(model.world_count, 3)
+                    for mesh in model.shape_source:
+                        self.assertEqual(mesh.opacity_threshold, 0.5)
+                        self.assertTrue(mesh.double_sided)
+                        np.testing.assert_array_equal(load_texture(mesh.opacity_texture), pixels)
+                        np.testing.assert_allclose(mesh.uvs[mesh.indices], expected_uvs)
+                    np.testing.assert_allclose(model.shape_opacity.numpy(), np.ones(3))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_cutout_face_varying_material_subset(self):
+        """A material subset keeps its own split face-corner UVs and cutout metadata."""
+        from pxr import UsdGeom, UsdShade, Vt
+
+        stage, prim, _, _, expected_uvs = self._make_cutout_stage("leaf.png", face_varying=True)
+        subset = UsdGeom.Subset.Define(stage, "/World/Leaf/cutout")
+        subset.CreateElementTypeAttr().Set(UsdGeom.Tokens.face)
+        subset.CreateFamilyNameAttr().Set("materialBind")
+        subset.CreateIndicesAttr().Set(Vt.IntArray([1]))
+        UsdShade.MaterialBindingAPI.Apply(subset.GetPrim()).Bind(
+            UsdShade.Material(stage.GetPrimAtPath("/Materials/Leaf"))
+        )
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage)
+        submesh = builder.shape_source[result["path_shape_map"]["/World/Leaf/cutout"]]
+        self.assertEqual(submesh.opacity_threshold, 0.5)
+        self.assertIsNotNone(submesh.opacity_texture)
+        self.assertTrue(submesh.double_sided)
+        np.testing.assert_allclose(submesh.uvs[submesh.indices], expected_uvs[3:])
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    @unittest.skipUnless(importlib.util.find_spec("PIL"), "Requires Pillow")
+    def test_cutout_alpha_only_and_opaque_materials(self):
+        """Do not infer an opacity texture from RGBA color, and load opacity-only UVs."""
+        from PIL import Image
+
+        pixels = np.array([[[12, 34, 56, 0], [12, 34, 56, 255]]], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            texture_path = os.path.join(tmpdir, "leaf.png")
+            Image.fromarray(pixels).save(texture_path)
+            stage, prim, _, _, expected_uvs = self._make_cutout_stage(texture_path, color=False)
+            builder = newton.ModelBuilder()
+            result = builder.add_usd(stage)
+            mesh = builder.shape_source[result["path_shape_map"]["/World/Leaf"]]
+            self.assertIsNone(mesh.texture)
+            self.assertIsNotNone(mesh.opacity_texture)
+            self.assertEqual(mesh.opacity, 1.0)
+            np.testing.assert_allclose(mesh.uvs[mesh.indices], expected_uvs)
+
+            stage, prim, _, _, _ = self._make_cutout_stage(texture_path, connected=False, threshold=None)
+            mesh = usd.get_mesh(prim.GetPrim(), load_uvs=True, compute_inertia=False)
+            self.assertIsNotNone(mesh.texture)
+            self.assertIsNone(mesh.opacity_texture)
+            self.assertIsNone(mesh.opacity_threshold)
+            self.assertEqual(mesh.opacity, 0.25)
+
+            stage, prim, _, _, _ = self._make_cutout_stage(texture_path, threshold=0.0)
+            mesh = usd.get_mesh(prim.GetPrim(), load_uvs=True, compute_inertia=False)
+            self.assertEqual(mesh.opacity_threshold, 0.0)
+            self.assertIsNotNone(mesh.opacity_texture)
+
+            stage, prim, _, texture, _ = self._make_cutout_stage(texture_path)
+            texture.GetInput("sourceColorSpace").Set("raw")
+            mesh = usd.get_mesh(prim.GetPrim(), load_uvs=True, compute_inertia=False)
+            self.assertIsInstance(mesh.opacity_texture, np.ndarray)
+            np.testing.assert_array_equal(mesh.opacity_texture[..., 3], pixels[..., 3])
+
+            stage, prim, _, _, _ = self._make_cutout_stage(texture_path, connected=False, threshold=0.5)
+            mesh = usd.get_mesh(prim.GetPrim(), load_uvs=True, compute_inertia=False)
+            self.assertIsNone(mesh.opacity_texture)
+            self.assertEqual(mesh.opacity, 0.25)
+            self.assertEqual(mesh.opacity_threshold, 0.5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_cutout_rejects_unsupported_source_mapping(self):
+        """Never silently substitute an unrelated channel, UV set, or addressing mode."""
+        from pxr import Sdf, UsdGeom, UsdShade
+
+        for invalid in (
+            "channel",
+            "wrap",
+            "scale",
+            "bias",
+            "missing_uv",
+            "bad_uv_count",
+            "uv_reader",
+            "different_uv",
+            "different_transform",
+        ):
+            with self.subTest(invalid=invalid):
+                stage, prim, surface, texture, _ = self._make_cutout_stage("leaf.png")
+                if invalid == "channel":
+                    surface.GetInput("opacity").ConnectToSource(texture.ConnectableAPI(), "r")
+                elif invalid == "wrap":
+                    texture.GetInput("wrapS").Set("clamp")
+                elif invalid == "scale":
+                    texture.CreateInput("scale", Sdf.ValueTypeNames.Float4).Set((1, 1, 1, 0.5))
+                elif invalid == "bias":
+                    texture.CreateInput("bias", Sdf.ValueTypeNames.Float4).Set((0, 0, 0, 0.1))
+                elif invalid == "missing_uv":
+                    UsdGeom.PrimvarsAPI(prim).GetPrimvar("st_leaf").GetAttr().Clear()
+                elif invalid == "bad_uv_count":
+                    UsdGeom.PrimvarsAPI(prim).GetPrimvar("st_leaf").Set([(0, 0)])
+                elif invalid == "uv_reader":
+                    UsdShade.Shader(stage.GetPrimAtPath("/Materials/Leaf/UV")).CreateIdAttr("OtherReader")
+                else:
+                    alpha = UsdShade.Shader.Define(stage, "/Materials/Leaf/Alpha")
+                    alpha.CreateIdAttr("UsdUVTexture")
+                    alpha.CreateInput("file", Sdf.ValueTypeNames.Asset).Set(Sdf.AssetPath("leaf.png"))
+                    alpha.CreateInput("wrapS", Sdf.ValueTypeNames.Token).Set("repeat")
+                    alpha.CreateInput("wrapT", Sdf.ValueTypeNames.Token).Set("repeat")
+                    alpha.CreateOutput("a", Sdf.ValueTypeNames.Float)
+                    reader = UsdShade.Shader(stage.GetPrimAtPath("/Materials/Leaf/UV"))
+                    if invalid == "different_uv":
+                        reader = UsdShade.Shader.Define(stage, "/Materials/Leaf/OtherUV")
+                        reader.CreateIdAttr("UsdPrimvarReader_float2")
+                        reader.CreateInput("varname", Sdf.ValueTypeNames.Token).Set("st")
+                        reader.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+                    if invalid == "different_transform":
+                        transform = UsdShade.Shader.Define(stage, "/Materials/Leaf/Transform")
+                        transform.CreateIdAttr("UsdTransform2d")
+                        transform.CreateInput("in", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                            reader.ConnectableAPI(), "result"
+                        )
+                        transform.CreateInput("translation", Sdf.ValueTypeNames.Float2).Set((0.5, 0))
+                        transform.CreateOutput("result", Sdf.ValueTypeNames.Float2)
+                        reader = transform
+                    alpha.CreateInput("st", Sdf.ValueTypeNames.Float2).ConnectToSource(
+                        reader.ConnectableAPI(), "result"
+                    )
+                    surface.GetInput("opacity").ConnectToSource(alpha.ConnectableAPI(), "a")
+                with self.assertRaises(ValueError):
+                    builder = newton.ModelBuilder()
+                    builder.add_usd(stage)
+
+        stage, prim, _, _, _ = self._make_cutout_stage("leaf.png", face_varying=True)
+        with self.assertRaisesRegex(ValueError, "per-vertex UVs"):
+            usd.get_mesh(prim.GetPrim(), load_uvs=True, preserve_facevarying_uvs=True, compute_inertia=False)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_visual_mesh_generates_sharp_normals(self):

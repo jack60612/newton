@@ -46,6 +46,7 @@ _COLLISION_EDGE_DEPRECATION_MSG = (
 
 if TYPE_CHECKING:
     from ..actuators.actuator import Actuator
+    from ..geometry.ray_opacity import RayOpacityTable
     from ..utils.heightfield import HeightfieldData
     from .collide import CollisionPipeline
 
@@ -1143,6 +1144,8 @@ class Model:
         """Local-space AABB per shape (min/max) for mesh and gaussian shapes, shape ``[shape_count, 2]`` [m]."""
         self.bvh_shape_world_transforms: wp.array[wp.transformf] | None = None
         """World-space shape transforms computed during shape BVH build/refit, shape ``[shape_count]`` [m, unitless quaternion]."""
+        self._ray_opacity: RayOpacityTable | None = None
+        """Model-owned texture cutout data shared by camera and ray queries."""
 
         self.bvh_particles: wp.Bvh | None = None
         """BVH over particles. Built by :meth:`ModelBuilder.finalize` when particles are present."""
@@ -2224,9 +2227,11 @@ class Model:
             compute_shape_local_bounds,
             compute_shape_world_transforms_launch,
         )
+        from ..geometry.ray_opacity import RayOpacityTable  # noqa: PLC0415
 
         if self.shape_count == 0:
             return
+        self._ray_opacity = RayOpacityTable(self)
 
         device = self.device
         shape_count = self.shape_count

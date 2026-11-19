@@ -797,6 +797,27 @@ such as ``lin_ap1_scene``, ``acescg``, ``srgb_ap1_scene`` or
 ``acescg``) and as sRGB otherwise, and a warning naming the prim or attribute
 is logged. The import itself does not fail.
 
+Material Opacity Cutouts
+-----------------------
+
+Rigid visual meshes preserve ``UsdPreviewSurface.opacityThreshold`` and scalar
+``opacity``. A positive threshold discards samples whose opacity is below the
+threshold; an absent or zero threshold does not enable cutout. An RGBA color
+texture is not an opacity source unless ``opacity`` is connected explicitly.
+An ``opacity`` connection to ``UsdUVTexture.outputs:a`` preserves that image's
+alpha channel without applying the RGB color-space conversion to it. A connected
+texture replaces, rather than multiplies, the shader's scalar opacity fallback.
+
+For cutout textures, the supported mapping uses a ``UsdPrimvarReader_float2``,
+vertex, varying, or face-varying UVs, and explicit ``repeat`` addressing on both
+axes. Color and opacity textures on the same mesh must share their UV primvar
+and texture transform. Non-alpha channels, non-default alpha scale or bias,
+other addressing modes, and missing or incompatible UVs are rejected for active
+cutouts rather than silently changing the silhouette. ``doubleSided`` is retained
+on the imported mesh. These material properties are copied when meshes and
+worlds are replicated.
+
+
 Mass and Inertia Precedence
 ---------------------------
 

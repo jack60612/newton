@@ -193,6 +193,9 @@ class Mesh:
         texture_transform: Sequence[Sequence[float]] | np.ndarray = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
         sdf: "SDF | None" = None,
         opacity: float | None = None,
+        opacity_threshold: float | None = None,
+        opacity_texture: str | np.ndarray | None = None,
+        double_sided: bool = False,
         enable_surface_velocity: bool = False,
     ):
         """
@@ -219,6 +222,12 @@ class Mesh:
                 authored UV coordinates as ``(u', v') = M @ (u, v) + t``.
             sdf: Optional prebuilt SDF object owned by this mesh.
             opacity: Optional per-mesh opacity in [0, 1].
+            opacity_threshold: Optional alpha-cutout threshold in [0, 1]. ``None`` or
+                zero disables cutout. Opacity values below a positive threshold are discarded.
+            opacity_texture: Optional texture whose alpha channel supplies surface opacity.
+                Uses the mesh UVs and ``texture_transform``; an RGBA color texture alone
+                does not imply an opacity texture.
+            double_sided: Render both sides of the surface. Defaults to ``False``.
             enable_surface_velocity: If ``True``, rigid contacts sample per-vertex
                 velocities from the finalized Warp mesh for friction. Solvers use
                 only the component tangent to the contact surface; normal motion
@@ -237,6 +246,9 @@ class Mesh:
         self.color = color
         self._opacity: float | None = None
         self.opacity = opacity
+        self.opacity_threshold = opacity_threshold
+        self.opacity_texture = opacity_texture
+        self.double_sided = bool(double_sided)
         # Store texture lazily: strings/paths are kept as-is, arrays are normalized
         self._texture = _normalize_texture_input(texture)
         self.texture_transform = texture_transform
@@ -823,6 +835,17 @@ class Mesh:
             vertices = self.vertices.copy()
         if indices is None:
             indices = self.indices.copy()
+        texture = (
+            self._texture
+            if isinstance(self._texture, str)
+            else (self._texture.copy() if self._texture is not None else None)
+        )
+        if self._opacity_texture is self._texture:
+            opacity_texture = texture
+        elif isinstance(self._opacity_texture, str):
+            opacity_texture = self._opacity_texture
+        else:
+            opacity_texture = self._opacity_texture.copy() if self._opacity_texture is not None else None
         m = Mesh(
             vertices,
             indices,
@@ -834,9 +857,10 @@ class Mesh:
             uvs=self.uvs.copy() if self.uvs is not None else None,
             color=self.color,
             opacity=self.opacity,
-            texture=self._texture
-            if isinstance(self._texture, str)
-            else (self._texture.copy() if self._texture is not None else None),
+            texture=texture,
+            opacity_threshold=self.opacity_threshold,
+            opacity_texture=opacity_texture,
+            double_sided=self.double_sided,
             roughness=self._roughness,
             metallic=self._metallic,
             texture_transform=self._texture_transform,
@@ -1582,6 +1606,41 @@ class Mesh:
         self._opacity = None if value is None else float(value)
 
     @property
+    def opacity_threshold(self) -> float | None:
+        """Alpha-cutout threshold; ``None`` or zero disables cutout."""
+        return self._opacity_threshold
+
+    @opacity_threshold.setter
+    def opacity_threshold(self, value: float | None):
+        threshold = None if value is None else float(value)
+        if threshold is not None and (not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0):
+            raise ValueError("opacity_threshold must be a finite value in [0, 1].")
+        self._opacity_threshold = threshold
+
+    @property
+    def opacity_texture(self) -> str | np.ndarray | None:
+        """Optional texture whose alpha channel supplies opacity."""
+        return self._opacity_texture
+
+    @opacity_texture.setter
+    def opacity_texture(self, value: str | np.ndarray | None):
+        self._opacity_texture = _normalize_texture_input(value)
+        self._opacity_texture_hash = None
+
+    @property
+    def opacity_texture_hash(self) -> int:
+        """Content-based hash of :attr:`opacity_texture`, cached until reassignment."""
+        if self._opacity_texture_hash is None:
+            if isinstance(self._opacity_texture, np.ndarray):
+                digest = hashlib.blake2b(memoryview(self._opacity_texture).cast("B"), digest_size=16).digest()
+                self._opacity_texture_hash = hash(
+                    (self._opacity_texture.shape, self._opacity_texture.dtype.str, digest)
+                )
+            else:
+                self._opacity_texture_hash = compute_texture_hash(self._opacity_texture)
+        return self._opacity_texture_hash
+
+    @property
     def texture(self) -> str | np.ndarray | None:
         """Optional texture as a file path or a normalized RGBA array."""
         return self._texture
@@ -1721,7 +1780,16 @@ class Mesh:
                     None if self._uvs is None else self._uvs.tobytes(),
                 )
             )
-        return hash((hash(self), self._cached_render_attribute_hash))
+        return hash(
+            (
+                hash(self),
+                self._cached_render_attribute_hash,
+                self.texture_transform,
+                self.opacity_threshold,
+                self.opacity_texture_hash,
+                self.double_sided,
+            )
+        )
 
     @override
     def __hash__(self) -> int:

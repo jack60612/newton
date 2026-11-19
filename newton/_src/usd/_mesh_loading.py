@@ -143,6 +143,10 @@ def _get_mesh_from_source(
         maxhullvert=maxhullvert,
         compute_inertia=compute_inertia,
         color=material_source.color if material_source is not None else None,
+        opacity=material_source.opacity if material_source is not None else None,
+        opacity_threshold=material_source.opacity_threshold if material_source is not None else None,
+        opacity_texture=material_source.opacity_texture if material_source is not None else None,
+        double_sided=material_source.double_sided if material_source is not None else False,
         texture=material_source.texture if material_source is not None else None,
         metallic=material_source.metallic if material_source is not None else None,
         roughness=material_source.roughness if material_source is not None else None,
@@ -741,6 +745,19 @@ def get_mesh(
         )
 
     material_props = resolve_material_properties_for_prim(prim) if load_visual_materials else {}
+    if load_uvs:
+        _validate_cutout_uvs(prim, material_props)
+    if (
+        load_uvs
+        and (material_props.get("opacity_threshold") or 0.0) > 0.0
+        and material_props.get("opacity_texture") is not None
+        and (
+            uvs is None
+            or len(uvs) != len(points)
+            or (preserve_facevarying_uvs and uvs_interpolation == UsdGeom.Tokens.faceVarying and not did_split_vertices)
+        )
+    ):
+        raise ValueError(f"Opacity texture on {prim.GetPath()} requires per-vertex UVs for every mesh vertex.")
 
     visual_topology = points is not source_points
     mesh_out = Mesh(
@@ -752,6 +769,9 @@ def get_mesh(
         compute_inertia=compute_inertia and not visual_topology,
         color=material_props.get("color"),
         opacity=material_props.get("opacity"),
+        opacity_threshold=material_props.get("opacity_threshold"),
+        opacity_texture=material_props.get("opacity_texture"),
+        double_sided=bool(mesh.GetDoubleSidedAttr().Get()),
         texture=material_props.get("texture"),
         metallic=material_props.get("metallic"),
         roughness=material_props.get("roughness"),
@@ -1201,7 +1221,7 @@ def _material_surface_shader(material: UsdShade.Material | None) -> UsdShade.Sha
     return None
 
 
-def _uvtexture_reader_varname(texture_shader: UsdShade.Shader) -> str | None:
+def _uvtexture_reader_varname(texture_shader: UsdShade.Shader, *, strict: bool = False) -> str | None:
     """Return the primvar read by a ``UsdUVTexture``, through an optional ``UsdTransform2d``."""
     st_input = texture_shader.GetInput("st")
     source = st_input.GetConnectedSource() if st_input else None
@@ -1214,6 +1234,8 @@ def _uvtexture_reader_varname(texture_shader: UsdShade.Shader) -> str | None:
         if not source:
             return None
         reader = UsdShade.Shader(source[0].GetPrim())
+    if strict and reader.GetIdAttr().Get() != "UsdPrimvarReader_float2":
+        return None
     varname = reader.GetInput("varname")
     if not varname:
         return None
@@ -1228,7 +1250,7 @@ def _uvtexture_reader_varname(texture_shader: UsdShade.Shader) -> str | None:
 
 
 def _uv_primvar_name_from_shader(shader: UsdShade.Shader | None) -> str | None:
-    """Resolve the texcoord primvar name a shader's base-color texture reads, or ``None``.
+    """Resolve the texcoord primvar name a shader's color or opacity texture reads, or ``None``.
 
     - ``UsdPreviewSurface``: follow the base-color ``UsdUVTexture``'s ``st`` input to its
       ``UsdPrimvarReader_float2`` and read ``inputs:varname``.
@@ -1241,7 +1263,7 @@ def _uv_primvar_name_from_shader(shader: UsdShade.Shader | None) -> str | None:
     except Exception:
         shader_id = None
     if shader_id == "UsdPreviewSurface":
-        for color_name in ("baseColor", "diffuseColor"):
+        for color_name in ("baseColor", "diffuseColor", "opacity"):
             color_input = shader.GetInput(color_name)
             source = color_input.GetConnectedSource() if color_input else None
             if not source:
@@ -1307,3 +1329,19 @@ def _find_uv_primvar(prim: Usd.Prim):
         if (name.startswith("uv") or name == "map1") and fallback is None:
             fallback = candidate
     return fallback
+
+
+def _validate_cutout_uvs(prim: Usd.Prim, material_props: dict[str, Any]) -> None:
+    """Reject cutouts whose authored UV set cannot be represented by the loaded mesh."""
+    if not (material_props.get("opacity_threshold") or 0.0) > 0.0:
+        return
+    if material_props.get("opacity_texture") is None:
+        return
+    expected = material_props.get("opacity_uv_primvar")
+    uv = _find_uv_primvar(prim)
+    if not uv or uv.GetPrimvarName() != expected:
+        raise ValueError(f"Opacity texture on {prim.GetPath()} requires UV primvar {expected!r}.")
+    if uv.GetInterpolation() not in (UsdGeom.Tokens.vertex, UsdGeom.Tokens.varying, UsdGeom.Tokens.faceVarying):
+        raise ValueError(
+            f"Opacity texture on {prim.GetPath()} has unsupported UV interpolation {uv.GetInterpolation()!r}."
+        )
