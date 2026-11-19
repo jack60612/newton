@@ -947,6 +947,11 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         return SolverMuJoCo._parse_named_int(value, {"dense": 0, "sparse": 1, "auto": 2})
 
     @staticmethod
+    def _parse_fluidshape(value: str | int, context: dict[str, Any] | None = None) -> int:
+        """Parse a geom fluid model: none=0, ellipsoid=1 (MJCF ``fluidshape``)."""
+        return SolverMuJoCo._parse_named_int(value, {"none": 0, "ellipsoid": 1})
+
+    @staticmethod
     def _parse_sleep_policy(value: str | int, context: dict[str, Any] | None = None) -> int:
         """Parse body sleep policy: auto=0, never=3, allowed=4, init=5."""
         return SolverMuJoCo._parse_named_int(
@@ -1622,6 +1627,35 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 namespace="mujoco",
                 usd_attribute_name="mjc:solmix",
                 mjcf_attribute_name="solmix",
+            )
+        )
+        # Per-geom MuJoCo fluid model (MJCF ``fluidshape`` / ``fluidcoef``). It acts only when the medium has a
+        # density or viscosity (``opt.density``/``opt.viscosity``) or wind, and is fixed at solver construction.
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="geom_fluidshape",
+                frequency=AttributeFrequency.SHAPE,
+                assignment=AttributeAssignment.MODEL,
+                dtype=wp.int32,
+                default=0,
+                namespace="mujoco",
+                usd_attribute_name="mjc:fluidshape",
+                mjcf_attribute_name="fluidshape",
+                mjcf_value_transformer=cls._parse_fluidshape,
+                usd_value_transformer=cls._parse_fluidshape,
+            )
+        )
+        builder.add_custom_attribute(
+            ModelBuilder.CustomAttribute(
+                name="geom_fluidcoef",
+                frequency=AttributeFrequency.SHAPE,
+                assignment=AttributeAssignment.MODEL,
+                dtype=vec5,
+                # MuJoCo's defaults: blunt drag, slender drag, angular drag, Kutta lift, Magnus lift.
+                default=vec5(0.5, 0.25, 1.5, 1.0, 1.0),
+                namespace="mujoco",
+                usd_attribute_name="mjc:fluidcoef",
+                mjcf_attribute_name="fluidcoef",
             )
         )
         builder.add_custom_attribute(
@@ -7365,6 +7399,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         shape_priority = get_custom_attribute("geom_priority")
         shape_geom_solimp = get_custom_attribute("geom_solimp")
         shape_geom_solmix = get_custom_attribute("geom_solmix")
+        shape_geom_fluidshape = get_custom_attribute("geom_fluidshape")
+        shape_geom_fluidcoef = get_custom_attribute("geom_fluidcoef")
         shape_mjc_solref = get_custom_attribute("solref")
         shape_mjc_solref_mode = get_custom_attribute("solref_mode")
         joint_dof_limit_margin = get_custom_attribute("limit_margin")
@@ -8153,6 +8189,10 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                     geom_params["solimp"] = shape_geom_solimp[shape]
                 if shape_geom_solmix is not None:
                     geom_params["solmix"] = shape_geom_solmix[shape]
+                if shape_geom_fluidshape is not None and int(shape_geom_fluidshape[shape]) != 0:
+                    geom_params["fluid_ellipsoid"] = int(shape_geom_fluidshape[shape])
+                    if shape_geom_fluidcoef is not None:
+                        geom_params["fluid_coefs"] = [float(value) for value in shape_geom_fluidcoef[shape]]
                 geom_params["gap"] = float(shape_gap[shape])
                 authored_margin = float(shape_margin[shape])
                 if self._zero_margins_for_native_ccd:

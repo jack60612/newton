@@ -4075,6 +4075,92 @@ class TestMuJoCoSolverGeomProperties(unittest.TestCase):
                 )
 
 
+class TestMuJoCoSolverGeomFluid(unittest.TestCase):
+    """Per-geom MuJoCo fluid model (``fluidshape``/``fluidcoef``) reaches MuJoCo Warp and exerts drag."""
+
+    RADIUS = 0.05
+    MASS = 0.01
+    AIR_DENSITY = 1.204
+    BLUNT = 0.5
+    WIND = 3.0
+    DT = 0.002
+
+    MJCF = f"""<mujoco>
+  <worldbody>
+    <body name="fluid" pos="0 0 1">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="{MASS}" diaginertia="1e-6 1e-6 1e-6"/>
+      <geom type="sphere" size="{RADIUS}" density="0" contype="8" conaffinity="0"
+            fluidshape="ellipsoid" fluidcoef="{BLUNT} 0 0 0 0"/>
+    </body>
+    <body name="plain" pos="2 0 1">
+      <freejoint/>
+      <inertial pos="0 0 0" mass="{MASS}" diaginertia="1e-6 1e-6 1e-6"/>
+      <geom type="sphere" size="{RADIUS}" density="0" contype="8" conaffinity="0"/>
+    </body>
+  </worldbody>
+</mujoco>"""
+
+    def _build(self, *, density, wind):
+        builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_mjcf(self.MJCF, ignore_inertial_definitions=False)
+        model = builder.finalize()
+        solver = SolverMuJoCo(
+            model,
+            solver="cg",
+            integrator="implicitfast",
+            iterations=20,
+            density=density,
+            wind=wind,
+            disable_contacts=True,
+        )
+        return model, solver
+
+    def _run(self, model, solver, steps):
+        state_0, state_1, control = model.state(), model.state(), model.control()
+        for _ in range(steps):
+            solver.step(state_0, state_1, control, None, self.DT)
+            state_0, state_1 = state_1, state_0
+        return state_0
+
+    def test_ellipsoid_geom_reaches_mujoco_warp(self):
+        """The ellipsoid model and its coefficients are compiled into the MuJoCo and MuJoCo Warp models."""
+        model, solver = self._build(density=self.AIR_DENSITY, wind=(self.WIND, 0.0, 0.0))
+        self.assertEqual(model.mujoco.geom_fluidshape.numpy().tolist(), [1, 0])
+        self.assertTrue(solver.mjw_model.has_fluid)
+
+        # Newton shape 0 is the tagged sphere, shape 1 the untagged one.
+        to_geom = {int(shape): geom for geom, shape in enumerate(solver.mjc_geom_to_newton_shape.numpy()[0])}
+        fluid = solver.mj_model.geom_fluid.reshape(solver.mj_model.ngeom, -1)
+        self.assertEqual(fluid[to_geom[0], 0], 1.0)  # mjFLUID_ELLIPSOID
+        self.assertAlmostEqual(float(fluid[to_geom[0], 1]), self.BLUNT, places=6)
+        np.testing.assert_allclose(fluid[to_geom[0], 2:6], 0.0, atol=1e-7)
+        self.assertEqual(fluid[to_geom[1], 0], 0.0)
+        ellipsoid = solver.mjw_model.body_fluid_ellipsoid.numpy()
+        self.assertEqual(int(ellipsoid.sum()), 1)
+
+    def test_ellipsoid_drag_matches_quadratic_relaxation(self):
+        """A free sphere relaxes to the wind as dv/dt = k (u - v)^2 / m with k = rho * blunt * pi r^2."""
+        model, solver = self._build(density=self.AIR_DENSITY, wind=(self.WIND, 0.0, 0.0))
+        steps = 500
+        state = self._run(model, solver, steps)
+        velocity = state.body_qd.numpy()[0]
+
+        k = self.AIR_DENSITY * self.BLUNT * np.pi * self.RADIUS**2
+        elapsed = steps * self.DT
+        expected = self.WIND - 1.0 / (1.0 / self.WIND + k * elapsed / self.MASS)
+        self.assertAlmostEqual(float(velocity[0]), expected, delta=0.01 * expected)
+        np.testing.assert_allclose(velocity[1:3], 0.0, atol=1e-5)
+
+    def test_fluid_attributes_are_inert_without_a_medium(self):
+        """Without density, viscosity or wind the fluid model is not compiled and nothing is dragged."""
+        model, solver = self._build(density=0.0, wind=(0.0, 0.0, 0.0))
+        self.assertFalse(solver.mjw_model.has_fluid)
+        state = self._run(model, solver, 50)
+        np.testing.assert_allclose(state.body_qd.numpy(), 0.0, atol=1e-9)
+
+
 class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
     def test_connect_anchor_precision_far_from_origin(self):
         builder = newton.ModelBuilder()

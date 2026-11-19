@@ -5773,6 +5773,51 @@ class TestImportMjcfSolverParams(unittest.TestCase):
             actual = geom_solmix[shape_idx].tolist()
             self.assertAlmostEqual(actual, expected, places=4)
 
+    def test_geom_fluidshape_parsing(self):
+        """Test that geom fluidshape and fluidcoef are parsed from MJCF, with MuJoCo's coefficient defaults."""
+        mjcf = """<?xml version="1.0" ?>
+<mujoco>
+    <default>
+        <default class="leaf">
+            <geom fluidshape="ellipsoid" fluidcoef="0.4 0 0 0 0"/>
+        </default>
+    </default>
+    <worldbody>
+        <body name="body1">
+            <freejoint/>
+            <geom type="sphere" size="0.05" fluidshape="ellipsoid" fluidcoef="0.5 0.1 0.2 0.3 0.4"/>
+        </body>
+        <body name="body2">
+            <freejoint/>
+            <geom type="sphere" size="0.05"/>
+        </body>
+        <body name="body3">
+            <freejoint/>
+            <geom type="box" size="0.1 0.1 0.1" fluidshape="ellipsoid"/>
+        </body>
+        <body name="body4">
+            <freejoint/>
+            <geom class="leaf" type="sphere" size="0.05"/>
+        </body>
+    </worldbody>
+</mujoco>
+"""
+
+        builder = newton.ModelBuilder()
+        builder.add_mjcf(mjcf)
+        model = builder.finalize()
+
+        self.assertTrue(hasattr(model.mujoco, "geom_fluidshape"), "Model should have geom_fluidshape attribute")
+        self.assertTrue(hasattr(model.mujoco, "geom_fluidcoef"), "Model should have geom_fluidcoef attribute")
+        self.assertEqual(model.shape_count, 4)
+
+        np.testing.assert_array_equal(model.mujoco.geom_fluidshape.numpy(), [1, 0, 1, 1])
+        coef = model.mujoco.geom_fluidcoef.numpy()
+        np.testing.assert_allclose(coef[0], [0.5, 0.1, 0.2, 0.3, 0.4], atol=1e-6)
+        np.testing.assert_allclose(coef[1], [0.5, 0.25, 1.5, 1.0, 1.0], atol=1e-6)  # MuJoCo default
+        np.testing.assert_allclose(coef[2], [0.5, 0.25, 1.5, 1.0, 1.0], atol=1e-6)
+        np.testing.assert_allclose(coef[3], [0.4, 0.0, 0.0, 0.0, 0.0], atol=1e-6)  # from the default class
+
     def test_shape_gap_from_mjcf(self):
         """Test that MJCF gap attribute is parsed into shape_gap."""
         mjcf = """<?xml version="1.0" ?>

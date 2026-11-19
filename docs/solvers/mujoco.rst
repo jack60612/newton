@@ -1247,6 +1247,27 @@ Registering MuJoCo custom attributes alone enables the ``model.mujoco``
 namespace but does not map ``mjc:damping`` to the built-in property.
 
 
+Fluid forces on shapes
+~~~~~~~~~~~~~~~~~~~~~~
+
+MuJoCo's passive fluid forces (drag, lift, added mass) act when the medium has
+a ``density``, a ``viscosity`` or a ``wind`` velocity, all arguments of
+:class:`~newton.solvers.SolverMuJoCo`. Whether the model carries fluid forces
+at all is fixed at construction, so give the medium a nonzero ``density`` or
+``viscosity`` if the wind is to change afterwards (``mjw_model.opt.wind`` of
+the MuJoCo Warp backend holds one vector per world).
+
+Without further data a body is modeled by MuJoCo's inertia-box approximation.
+A shape selects MuJoCo's ellipsoid model, using the shape's own size, with the
+``mujoco:geom_fluidshape`` custom attribute (MJCF ``fluidshape="ellipsoid"``,
+USD ``mjc:fluidshape = "ellipsoid"``). ``mujoco:geom_fluidcoef`` carries the five
+MuJoCo ``fluidcoef`` coefficients: blunt drag, slender drag, angular drag,
+Kutta lift and Magnus lift (default ``0.5 0.25 1.5 1.0 1.0``). The drag force
+on a sphere of projected area :math:`A` moving at relative speed :math:`v` with
+blunt coefficient :math:`c` is :math:`\rho\, c\, A\, v^2`, i.e. a conventional
+drag coefficient :math:`C_D = 2c`.
+
+
 Unsupported MuJoCo features
 ---------------------------
 

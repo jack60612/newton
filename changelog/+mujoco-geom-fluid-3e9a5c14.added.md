@@ -1,0 +1,1 @@
+Add per-geom MuJoCo fluid model attributes `mujoco:geom_fluidshape` and `mujoco:geom_fluidcoef`, imported from MJCF `fluidshape`/`fluidcoef` and USD `mjc:fluidshape`/`mjc:fluidcoef`, so that `SolverMuJoCo` compiles the ellipsoid drag model for tagged shapes when `density`, `viscosity` or `wind` is set.

@@ -2168,6 +2168,115 @@ def PhysicsRevoluteJoint "Joint2"
         self.assertTrue(found_explicit_2, f"Expected solmix {expected_explicit_2} not found in model")
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_geom_fluidshape_parsing(self):
+        """Test that mjc:fluidshape and mjc:fluidcoef are parsed from USD, with MuJoCo's coefficient defaults."""
+        from pxr import Usd
+
+        usd_content = """#usda 1.0
+(
+    upAxis = "Z"
+)
+
+def PhysicsScene "physicsScene"
+{
+}
+
+def Xform "Body1" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI", "PhysicsArticulationRootAPI"]
+)
+{
+    double3 xformOp:translate = (0, 0, 1)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def Sphere "Collision1" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double radius = 0.05
+        uniform token mjc:fluidshape = "ellipsoid"
+        uniform double[] mjc:fluidcoef = [0.5, 0.1, 0.2, 0.3, 0.4]
+    }
+}
+
+def Xform "Body2" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+)
+{
+    double3 xformOp:translate = (1, 0, 1)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def Sphere "Collision2" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double radius = 0.1
+    }
+}
+
+def PhysicsRevoluteJoint "Joint1"
+{
+    rel physics:body0 = </Body1>
+    rel physics:body1 = </Body2>
+    point3f physics:localPos0 = (0, 0, 0)
+    point3f physics:localPos1 = (0, 0, 0)
+    quatf physics:localRot0 = (1, 0, 0, 0)
+    quatf physics:localRot1 = (1, 0, 0, 0)
+    token physics:axis = "Z"
+}
+
+def Xform "Body3" (
+    prepend apiSchemas = ["PhysicsRigidBodyAPI"]
+)
+{
+    double3 xformOp:translate = (2, 0, 1)
+    uniform token[] xformOpOrder = ["xformOp:translate"]
+
+    def Sphere "Collision3" (
+        prepend apiSchemas = ["PhysicsCollisionAPI"]
+    )
+    {
+        double radius = 0.05
+        uniform token mjc:fluidshape = "ellipsoid"
+    }
+}
+
+def PhysicsRevoluteJoint "Joint2"
+{
+    rel physics:body0 = </Body2>
+    rel physics:body1 = </Body3>
+    point3f physics:localPos0 = (0, 0, 0)
+    point3f physics:localPos1 = (0, 0, 0)
+    quatf physics:localRot0 = (1, 0, 0, 0)
+    quatf physics:localRot1 = (1, 0, 0, 0)
+    token physics:axis = "Y"
+}
+"""
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(usd_content)
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage)
+        model = builder.finalize()
+
+        self.assertTrue(hasattr(model.mujoco, "geom_fluidshape"), "Model should have geom_fluidshape attribute")
+        self.assertTrue(hasattr(model.mujoco, "geom_fluidcoef"), "Model should have geom_fluidcoef attribute")
+        self.assertEqual(model.shape_count, 3)
+
+        shapes = {name: i for i, name in enumerate(model.shape_label)}
+        fluidshape = model.mujoco.geom_fluidshape.numpy()
+        coef = model.mujoco.geom_fluidcoef.numpy()
+        first = next(i for name, i in shapes.items() if name.endswith("Collision1"))
+        second = next(i for name, i in shapes.items() if name.endswith("Collision2"))
+        third = next(i for name, i in shapes.items() if name.endswith("Collision3"))
+        self.assertEqual(int(fluidshape[first]), 1)
+        self.assertEqual(int(fluidshape[second]), 0)
+        self.assertEqual(int(fluidshape[third]), 1)
+        np.testing.assert_allclose(coef[first], [0.5, 0.1, 0.2, 0.3, 0.4], atol=1e-6)
+        np.testing.assert_allclose(coef[second], [0.5, 0.25, 1.5, 1.0, 1.0], atol=1e-6)  # MuJoCo default
+        np.testing.assert_allclose(coef[third], [0.5, 0.25, 1.5, 1.0, 1.0], atol=1e-6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_shape_gap_from_usd(self):
         """Test that mjc:gap attribute is parsed into shape_gap from USD."""
         from pxr import Usd
