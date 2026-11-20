@@ -241,9 +241,8 @@ vec2 bump(vec2 x)
     return (floor(x / 2.0) + 2.0 * max(x / 2.0 - floor(x / 2.0) - 0.5, 0.0));
 }
 
-float checker(vec2 uv)
+float checker(vec2 uv, float width)
 {
-    float width = filterwidth(uv);
     vec2 p0 = uv - 0.5 * width;
     vec2 p1 = uv + 0.5 * width;
 
@@ -296,7 +295,7 @@ vec3 ReconstructCameraRelativePosition()
     return transpose(mat3(view)) * view_position;
 }
 
-float ShadowCalculation(vec3 camera_to_fragment)
+float ShadowCalculation(vec3 camera_to_fragment, vec3 camera_dx, vec3 camera_dy)
 {
     vec4 light_space_pos = light_space_matrix * vec4(camera_to_fragment, 1.0);
     vec3 projCoords = light_space_pos.xyz/light_space_pos.w;
@@ -304,12 +303,11 @@ float ShadowCalculation(vec3 camera_to_fragment)
     // map to [0,1]
     projCoords = projCoords * 0.5 + 0.5;
 
-    // Fit the receiver plane before divergent control flow. Each PCF tap needs
-    // the receiver depth at its own texel center, especially on sloping ramps.
+    // Derivatives were taken before any alpha-cutout discard in main().
     // Differentiate before the orthographic depth translation to retain the
     // tiny depth differences of small triangles across a large depth range.
-    vec3 dx = 0.5 * mat3(light_space_matrix) * dFdx(camera_to_fragment);
-    vec3 dy = 0.5 * mat3(light_space_matrix) * dFdy(camera_to_fragment);
+    vec3 dx = 0.5 * mat3(light_space_matrix) * camera_dx;
+    vec3 dy = 0.5 * mat3(light_space_matrix) * camera_dy;
     float determinant = dx.x * dy.y - dx.y * dy.x;
     vec2 depthGradient = vec2(0.0);
     if (abs(determinant) > 1.0e-5 * length(dx.xy) * length(dy.xy))
@@ -404,31 +402,42 @@ vec3 sample_env_map(vec3 dir, float lod)
 
 void main()
 {
-    apply_alpha_cutout(TexCoord, Opacity, Cutout);
-
+    // Derivatives after a non-uniform discard are undefined. Capture them
+    // while all fragment invocations are still in uniform control flow.
+    vec2 tex_dx = dFdx(TexCoord);
+    vec2 tex_dy = dFdy(TexCoord);
+    float checker_scale = 1.0;
+    vec2 checker_uv = LocalPos.xy * checker_scale;
+    float checker_width = filterwidth(checker_uv);
     // This reconstruction also corrects depth before the fragment is committed.
     vec3 camera_to_fragment = ReconstructCameraRelativePosition();
+    vec3 camera_dx = vec3(0.0);
+    vec3 camera_dy = vec3(0.0);
+    if (enable_shadows)
+    {
+        camera_dx = dFdx(camera_to_fragment);
+        camera_dy = dFdy(camera_to_fragment);
+    }
+    apply_alpha_cutout(TexCoord, Opacity, Cutout);
 
     // material properties from vertex shader
     float roughness = clamp(Material.x, 0.0, 1.0);
     float metallic = clamp(Material.y, 0.0, 1.0);
     float checker_enable = Material.z;
     float texture_enable = Material.w;
-    float checker_scale = 1.0;
 
     // convert to linear space
     vec3 albedo = pow(ObjectColor, vec3(2.2));
     if (texture_enable > 0.5)
     {
-        vec3 tex_color = texture(albedo_map, TexCoord).rgb;
+        vec3 tex_color = textureGrad(albedo_map, TexCoord, tex_dx, tex_dy).rgb;
         albedo *= pow(tex_color, vec3(2.2));
     }
 
     // Optional checker pattern in object-space so it follows instance transforms
     if (checker_enable > 0.0)
     {
-        vec2 uv = LocalPos.xy * checker_scale;
-        float cb = checker(uv);
+        float cb = checker(checker_uv, checker_width);
         vec3 albedo2 = albedo*0.7;
         // pick between the two colors
         albedo = mix(albedo, albedo2, cb);
@@ -498,7 +507,7 @@ void main()
     ambient = kD_ambient * ambient + ambient_spec * metallic;
 
     // shadows
-    float shadow = enable_shadows ? ShadowCalculation(camera_to_fragment) : 0.0;
+    float shadow = enable_shadows ? ShadowCalculation(camera_to_fragment, camera_dx, camera_dy) : 0.0;
 
     float spotAttenuation = SpotlightAttenuation(camera_to_fragment);
     vec3 color = ambient + (1.0 - shadow) * spotAttenuation * Lo;
