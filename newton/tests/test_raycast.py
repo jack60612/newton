@@ -702,6 +702,7 @@ def test_intersect_ray(test: TestRaycast, device: str):
     out_dist = wp.empty(shape=3, dtype=float, device=device)
     out_shape_id = wp.empty(shape=3, dtype=wp.int32, device=device)
     out_normal = wp.empty(shape=3, dtype=wp.vec3, device=device)
+    out_alpha_rejections = wp.full(shape=3, value=99, dtype=wp.int32, device=device)
     newton.intersect_ray(
         model,
         ray_origins=origins,
@@ -710,10 +711,12 @@ def test_intersect_ray(test: TestRaycast, device: str):
         out_dist=out_dist,
         out_shape_id=out_shape_id,
         out_normal=out_normal,
+        out_alpha_rejections=out_alpha_rejections,
     )
 
     np.testing.assert_allclose(out_dist.numpy(), np.array([1.5, 1.5, -1.0], dtype=np.float32), atol=1e-5)
     np.testing.assert_array_equal(out_shape_id.numpy(), np.array([0, 1, -1], dtype=np.int32))
+    np.testing.assert_array_equal(out_alpha_rejections.numpy(), np.zeros(3, dtype=np.int32))
     np.testing.assert_allclose(
         out_normal.numpy(),
         np.array(
@@ -1016,19 +1019,41 @@ def test_intersect_ray_misses_when_no_shape_is_selected(test: TestRaycast, devic
     out_dist = wp.full(shape=1, value=5.0, dtype=float, device=device)
     out_shape_id = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
     out_normal = wp.full(shape=1, value=wp.vec3(1.0, 1.0, 1.0), dtype=wp.vec3, device=device)
-    newton.intersect_ray(
-        model,
-        ray_origins=origins,
-        ray_directions=directions,
-        ray_worlds=worlds,
-        out_dist=out_dist,
-        out_shape_id=out_shape_id,
-        out_normal=out_normal,
-    )
+    out_truncated = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
+    out_alpha_rejections = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
 
-    np.testing.assert_array_equal(out_dist.numpy(), np.array([-1.0], dtype=np.float32))
-    np.testing.assert_array_equal(out_shape_id.numpy(), np.array([-1], dtype=np.int32))
-    np.testing.assert_array_equal(out_normal.numpy(), np.zeros((1, 3), dtype=np.float32))
+    def cast():
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            out_dist=out_dist,
+            out_shape_id=out_shape_id,
+            out_normal=out_normal,
+            out_truncated=out_truncated,
+            out_alpha_rejections=out_alpha_rejections,
+        )
+
+    def check():
+        np.testing.assert_array_equal(out_dist.numpy(), np.array([-1.0], dtype=np.float32))
+        np.testing.assert_array_equal(out_shape_id.numpy(), np.array([-1], dtype=np.int32))
+        np.testing.assert_array_equal(out_normal.numpy(), np.zeros((1, 3), dtype=np.float32))
+        np.testing.assert_array_equal(out_truncated.numpy(), np.array([0], dtype=np.int32))
+        np.testing.assert_array_equal(out_alpha_rejections.numpy(), np.array([0], dtype=np.int32))
+
+    cast()
+    check()
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast()
+        out_dist.fill_(5.0)
+        out_shape_id.fill_(7)
+        out_normal.fill_(wp.vec3(1.0, 1.0, 1.0))
+        out_truncated.fill_(7)
+        out_alpha_rejections.fill_(7)
+        wp.capture_launch(capture.graph)
+        check()
 
 
 add_function_test(

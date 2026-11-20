@@ -22,6 +22,8 @@ from .types import GeoType, Mesh
 if TYPE_CHECKING:
     from ..sim.model import Model
 
+_MAX_SAME_FACE_RETRIES = 4
+
 
 @wp.struct
 class RayOpacity:
@@ -211,11 +213,15 @@ def _next_float(value: wp.float32, positive: wp.bool) -> wp.float32:
 def make_mesh_cutout_intersection(compute_normal: bool):
     """Build a closest opaque triangle query using Warp's native mesh raycast.
 
-    A bounded number of rejected triangles may be traversed.  Since Warp's
-    native mesh query has no minimum-distance parameter, each continuation
-    advances the ray parameter by one representable float.  Exactly coplanar
-    triangles and surfaces within its rounding interval cannot be distinguished.
-    Exhaustion is reported to the caller rather than treated as a miss.
+    A bounded number of rejected triangles may be traversed. Warp's mesh
+    query has no minimum-distance parameter, so continuation advances the
+    query origin in local position space. The advance is at least four ULPs
+    of the largest local origin or hit coordinate, converted to ray-parameter
+    units using the largest direction component and rounded upward in the ray
+    parameter. A near re-hit of the same face doubles the advance without
+    spending the rejection budget, up to four times per rejected face.
+    Exhausting either bound is reported to the caller rather than treated as a
+    miss. Intersections within an advance are ambiguous and can be skipped.
     """
 
     @wp.func
@@ -233,28 +239,57 @@ def make_mesh_cutout_intersection(compute_normal: bool):
         if mesh_id == wp.uint64(0):
             return -1.0, wp.vec3f(0.0), 0.0, 0.0, -1, 0, False
         rejected = wp.int32(0)
+        last_rejected_face = wp.int32(-1)
+        last_advance = wp.float32(0.0)
+        same_face_retries = wp.int32(0)
         offset = wp.float32(0.0)
+        query_origin = origin
+        direction_max = wp.float32(0.0)
+        origin_max = wp.float32(0.0)
         while offset < max_t:
-            result = wp.mesh_query_ray(mesh_id, origin + direction * offset, direction, max_t - offset)
+            result = wp.mesh_query_ray(mesh_id, query_origin, direction, max_t - offset)
             if not result.result:
                 break
             hit_t = offset + result.t
-            if (not cull_backfaces or wp.dot(direction, result.normal) < 0.0) and accepts_hit(
-                material, scalar_opacity, mesh_id, result.face, result.u, result.v
-            ):
-                normal = wp.vec3f(0.0)
-                if wp.static(compute_normal):
-                    inv_scale = wp.vec3f(
-                        1.0 / wp.where(scale[0] != 0.0, scale[0], 1.0e-6),
-                        1.0 / wp.where(scale[1] != 0.0, scale[1], 1.0e-6),
-                        1.0 / wp.where(scale[2] != 0.0, scale[2], 1.0e-6),
-                    )
-                    normal = wp.normalize(wp.cw_mul(result.normal, inv_scale))
-                return hit_t, normal, result.u, result.v, result.face, rejected, False
-            if rejected >= max_rejections:
-                return -1.0, wp.vec3f(0.0), 0.0, 0.0, -1, rejected, True
-            rejected += 1
-            offset = _next_float(hit_t, True)
+            same_face_retry = result.face == last_rejected_face and result.t <= last_advance
+            if same_face_retry:
+                if same_face_retries >= wp.static(_MAX_SAME_FACE_RETRIES):
+                    return -1.0, wp.vec3f(0.0), 0.0, 0.0, -1, rejected, True
+                same_face_retries += 1
+            if not same_face_retry:
+                if (not cull_backfaces or wp.dot(direction, result.normal) < 0.0) and accepts_hit(
+                    material, scalar_opacity, mesh_id, result.face, result.u, result.v
+                ):
+                    normal = wp.vec3f(0.0)
+                    if wp.static(compute_normal):
+                        inv_scale = wp.vec3f(
+                            1.0 / wp.where(scale[0] != 0.0, scale[0], 1.0e-6),
+                            1.0 / wp.where(scale[1] != 0.0, scale[1], 1.0e-6),
+                            1.0 / wp.where(scale[2] != 0.0, scale[2], 1.0e-6),
+                        )
+                        normal = wp.normalize(wp.cw_mul(result.normal, inv_scale))
+                    return hit_t, normal, result.u, result.v, result.face, rejected, False
+                if rejected >= max_rejections:
+                    return -1.0, wp.vec3f(0.0), 0.0, 0.0, -1, rejected, True
+                rejected += 1
+                same_face_retries = 0
+                last_rejected_face = result.face
+                if rejected == 1:
+                    direction_max = wp.max(wp.abs(direction[0]), wp.max(wp.abs(direction[1]), wp.abs(direction[2])))
+                    origin_max = wp.max(1.0, wp.max(wp.abs(origin[0]), wp.max(wp.abs(origin[1]), wp.abs(origin[2]))))
+            hit_position = query_origin + direction * result.t
+
+            hit_max = wp.max(wp.abs(hit_position[0]), wp.max(wp.abs(hit_position[1]), wp.abs(hit_position[2])))
+            coordinate = wp.max(origin_max, hit_max)
+            position_ulp = _next_float(coordinate, True) - coordinate
+            advance = wp.max(4.0 * position_ulp / direction_max, _next_float(hit_t, True) - hit_t)
+            if same_face_retry:
+                # Escape grazing or rounded self-hits in logarithmic time.
+                advance = wp.max(advance, 2.0 * last_advance)
+            next_offset = _next_float(hit_t + advance, True)
+            last_advance = next_offset - hit_t
+            query_origin = hit_position + direction * last_advance
+            offset = next_offset
         return -1.0, wp.vec3f(0.0), 0.0, 0.0, -1, rejected, False
 
     return intersect
