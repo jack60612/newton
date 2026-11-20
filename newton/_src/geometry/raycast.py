@@ -931,6 +931,7 @@ def intersect_ray(
     ray_directions: wp.array[wp.vec3],
     ray_worlds: wp.array[wp.int32],
     ray_enabled: wp.array[wp.bool] | None = None,
+    ray_count: wp.array[wp.int32] | None = None,
     enable_global_world: bool = True,
     out_dist: wp.array[float] | None = None,
     out_shape_id: wp.array[wp.int32] | None = None,
@@ -989,6 +990,10 @@ def intersect_ray(
             global world.
         ray_enabled: Optional per-ray mask, shape [ray_count]. Disabled rays
             return the normal miss outputs without traversing the BVH.
+        ray_count: Optional single-element device array holding the number of leading rays to cast, so a caller
+            with a device-side count (for example compacted rays inside a CUDA graph) can launch the maximum size.
+            Rays at or beyond ``ray_count[0]`` return at once without reading or writing any array; their outputs
+            are unspecified. The count must not exceed the number of rays in the input arrays.
         enable_global_world: Whether to enable global world raycasting.
         out_dist: Optional output hit distances [m], shape [ray_count]. ``-1`` on miss.
         out_shape_id: Optional output hit shape indices, shape [ray_count]. ``-1`` on miss.
@@ -1045,6 +1050,7 @@ def intersect_ray(
     write_truncated = out_truncated is not None
     write_alpha_rejections = out_alpha_rejections is not None
     has_ray_mask = ray_enabled is not None
+    has_ray_count = ray_count is not None
     cutouts = model._ray_opacity
     has_cutouts = cutouts is not None and cutouts.has_cutouts
     if has_cutouts and out_truncated is None:
@@ -1068,6 +1074,7 @@ def intersect_ray(
         ray_direction: wp.array[wp.vec3],
         ray_world: wp.array[wp.int32],
         ray_enabled: wp.array[wp.bool],
+        ray_count: wp.array[wp.int32],
         out_dist: wp.array[float],
         out_shape_id: wp.array[wp.int32],
         out_face_id: wp.array[wp.int32],
@@ -1076,6 +1083,9 @@ def intersect_ray(
         out_alpha_rejections: wp.array[wp.int32],
     ):
         rayid = wp.tid()
+        if wp.static(has_ray_count):
+            if rayid >= ray_count[0]:
+                return
         if wp.static(has_ray_mask):
             if not ray_enabled[rayid]:
                 if wp.static(write_dist):
@@ -1233,6 +1243,7 @@ def intersect_ray(
             ray_directions,
             ray_worlds,
             ray_enabled,
+            ray_count,
         ],
         outputs=[
             out_dist,

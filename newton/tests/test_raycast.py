@@ -879,6 +879,75 @@ def test_intersect_ray_face_ids(test: TestRaycast, device: str):
         check()
 
 
+def test_intersect_ray_count(test: TestRaycast, device: str):
+    """Rays beyond a device-side count are not touched, the others match the full cast, also in a graph."""
+    quad = newton.Mesh(
+        np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], dtype=np.float32),
+        np.array([0, 1, 2, 0, 2, 3], dtype=np.int32),
+        compute_inertia=False,
+    )
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    mesh = builder.add_shape_mesh(-1, mesh=quad)
+    sphere = builder.add_shape_sphere(-1, radius=0.25, xform=wp.transform(wp.vec3(3.0, 0.0, 0.0), wp.quat_identity()))
+    builder.end_world()
+    model = builder.finalize(device=device)
+
+    origins = wp.array(
+        [[0.5, 0.0, 2.0], [-0.5, 0.0, 2.0], [3.0, 0.0, 2.0], [10.0, 0.0, 2.0], [0.5, 0.0, 2.0]],
+        dtype=wp.vec3,
+        device=device,
+    )
+    directions = wp.array([[0, 0, -1]] * 5, dtype=wp.vec3, device=device)
+    worlds = wp.zeros(5, dtype=wp.int32, device=device)
+    count = wp.array([3], dtype=wp.int32, device=device)
+    full_dist = wp.empty(5, dtype=wp.float32, device=device)
+    full_shape = wp.empty(5, dtype=wp.int32, device=device)
+    dist = wp.full(5, 99.0, dtype=wp.float32, device=device)
+    shape = wp.full(5, 99, dtype=wp.int32, device=device)
+
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_dist=full_dist,
+        out_shape_id=full_shape,
+    )
+
+    def cast():
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            ray_count=count,
+            out_dist=dist,
+            out_shape_id=shape,
+        )
+
+    def check(cast_rays):
+        expected_shape = full_shape.numpy().copy()
+        expected_dist = full_dist.numpy().copy()
+        expected_shape[cast_rays:] = 99
+        expected_dist[cast_rays:] = 99.0
+        np.testing.assert_array_equal(shape.numpy(), expected_shape)
+        np.testing.assert_array_equal(dist.numpy(), expected_dist)
+
+    np.testing.assert_array_equal(full_shape.numpy(), [mesh, mesh, sphere, -1, mesh])
+    cast()
+    check(3)
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast()
+        for cast_rays in (5, 0, 2):
+            count.fill_(cast_rays)
+            dist.fill_(99.0)
+            shape.fill_(99)
+            wp.capture_launch(capture.graph)
+            check(cast_rays)
+
+
 def test_intersect_ray_convex_mesh_face_ids(test: TestRaycast, device: str):
     vertices = np.array(
         [
@@ -1153,6 +1222,7 @@ add_function_test(
 )
 add_function_test(TestRaycast, "test_intersect_ray", test_intersect_ray, devices=devices)
 add_function_test(TestRaycast, "test_intersect_ray_face_ids", test_intersect_ray_face_ids, devices=devices)
+add_function_test(TestRaycast, "test_intersect_ray_count", test_intersect_ray_count, devices=devices)
 add_function_test(
     TestRaycast, "test_intersect_ray_convex_mesh_face_ids", test_intersect_ray_convex_mesh_face_ids, devices=devices
 )
