@@ -936,6 +936,7 @@ def intersect_ray(
     out_shape_id: wp.array[wp.int32] | None = None,
     out_normal: wp.array[wp.vec3] | None = None,
     out_truncated: wp.array[wp.int32] | None = None,
+    out_alpha_rejections: wp.array[wp.int32] | None = None,
     max_alpha_rejections: int = 8,
     fast_math: bool = True,
 ):
@@ -957,12 +958,26 @@ def intersect_ray(
     per ray across all candidate shapes and worlds. When it is exhausted, the
     result is a miss and ``out_truncated`` is 1; this output is required for a
     model with cutouts so incomplete rays cannot be silently mistaken for misses.
-    Warp has no minimum-distance mesh query, so continuation advances the ray
-    parameter by one float32 ULP per rejection. Coplanar or closer-than-rounding
-    intersections in the same mesh are ambiguous.
+    Warp has no minimum-distance mesh query. After a rejection, continuation
+    advances the query origin along the ray by at least
+    ``max(4 * ulp(M) / D, ulp(t))`` in ray-parameter units, where ``M`` is
+    the maximum of 1 and the absolute local origin and hit coordinates, and
+    ``D`` is the largest absolute component of the local ray direction. The
+    next offset is rounded up by one parameter ULP, and scaling does not
+    change the world-distance units of ``t``. A near re-hit of the same face
+    is retried with a doubled advance, without another rejection, at most
+    four times per rejected face. A further re-hit fails closed and reports
+    truncation. For an axis-aligned identity-scale ray with local coordinates
+    and parameter near 100 m, the first advance is about 38.1 µm. Four
+    doublings and parameter rounding give a final individual advance of about
+    725 µm and a cumulative advance of about 1.38 mm, plus near-self-hit
+    distances of up to about 0.66 mm and position rounding. Scale, direction
+    and coordinate magnitude affect these bounds; nearby intersections can be
+    skipped, and there is no universal fixed world-space skip distance.
 
-    ``out_dist``, ``out_shape_id`` and ``out_normal`` are optional outputs.
-    Pass ``None`` to skip writing a channel.
+    ``out_dist``, ``out_shape_id``, ``out_normal``, and
+    ``out_alpha_rejections`` are optional outputs. Pass ``None`` to skip
+    writing a channel.
 
     Args:
         model: Model containing the shapes to query.
@@ -977,8 +992,17 @@ def intersect_ray(
         out_dist: Optional output hit distances [m], shape [ray_count]. ``-1`` on miss.
         out_shape_id: Optional output hit shape indices, shape [ray_count]. ``-1`` on miss.
         out_normal: Optional output hit normals, shape [ray_count, 3].
-        out_truncated: Per-ray int32 diagnostic, 1 on exhausted budget, 0 otherwise.
-            Required if the model has cutout materials; shape [ray_count].
+        out_truncated: Per-ray int32 diagnostic, 1 on exhausted rejection or
+            self-hit retry budget, 0 otherwise. Required if the model has
+            cutout materials; shape [ray_count].
+        out_alpha_rejections: Optional per-ray int32 count of transparent triangle
+            candidates rejected during traversal, summed across the visited shapes
+            and worlds; shape [ray_count]. A near re-hit of the last rejected face
+            is not counted again. The count depends on BVH traversal order and
+            closest-hit pruning, not just the surfaces on the final ray path. It
+            includes the rejection that reaches the budget, but not a subsequent
+            candidate that would exceed it and causes truncation. Disabled rays and
+            rays with no rejections report 0.
         max_alpha_rejections: Maximum rejected triangles per ray before reporting truncation.
         fast_math: Whether to compile the intersection kernel with fast math enabled.
     """
@@ -995,6 +1019,8 @@ def intersect_ray(
             out_normal.zero_()
         if out_truncated is not None:
             out_truncated.zero_()
+        if out_alpha_rejections is not None:
+            out_alpha_rejections.zero_()
         return
 
     if model.bvh_shapes is None:
@@ -1009,6 +1035,7 @@ def intersect_ray(
     write_shape_id = out_shape_id is not None
     write_normal = out_normal is not None
     write_truncated = out_truncated is not None
+    write_alpha_rejections = out_alpha_rejections is not None
     has_ray_mask = ray_enabled is not None
     cutouts = model._ray_opacity
     has_cutouts = cutouts is not None and cutouts.has_cutouts
@@ -1037,6 +1064,7 @@ def intersect_ray(
         out_shape_id: wp.array[wp.int32],
         out_normal: wp.array[wp.vec3],
         out_truncated: wp.array[wp.int32],
+        out_alpha_rejections: wp.array[wp.int32],
     ):
         rayid = wp.tid()
         if wp.static(has_ray_mask):
@@ -1049,6 +1077,8 @@ def intersect_ray(
                     out_normal[rayid] = wp.vec3(0.0)
                 if wp.static(write_truncated):
                     out_truncated[rayid] = 0
+                if wp.static(write_alpha_rejections):
+                    out_alpha_rejections[rayid] = 0
                 return
 
         origin = ray_origin[rayid]
@@ -1149,6 +1179,8 @@ def intersect_ray(
             out_normal[rayid] = min_normal
         if wp.static(write_truncated):
             out_truncated[rayid] = wp.int32(truncated)
+        if wp.static(write_alpha_rejections):
+            out_alpha_rejections[rayid] = rejected
 
     wp.launch(
         kernel=_intersect_ray_kernel,
@@ -1176,6 +1208,7 @@ def intersect_ray(
             out_shape_id,
             out_normal,
             out_truncated,
+            out_alpha_rejections,
         ],
         device=model.device,
     )

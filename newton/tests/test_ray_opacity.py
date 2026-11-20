@@ -275,6 +275,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
     ids = wp.empty(1, dtype=wp.int32, device=device)
     normal = wp.empty(1, dtype=wp.vec3f, device=device)
     truncated = wp.empty(1, dtype=wp.int32, device=device)
+    rejections = wp.full(1, 99, dtype=wp.int32, device=device)
     with test.assertRaisesRegex(ValueError, "out_truncated"):
         newton.intersect_ray(model, ray_origins=origins, ray_directions=directions, ray_worlds=worlds)
     newton.intersect_ray(
@@ -286,9 +287,11 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
         out_shape_id=ids,
         out_normal=normal,
         out_truncated=truncated,
+        out_alpha_rejections=rejections,
         max_alpha_rejections=1,
     )
     np.testing.assert_array_equal(truncated.numpy(), [1])
+    np.testing.assert_array_equal(rejections.numpy(), [1])
     np.testing.assert_array_equal(dist.numpy(), [-1.0])
     np.testing.assert_array_equal(ids.numpy(), [-1])
     np.testing.assert_array_equal(normal.numpy(), [[0.0, 0.0, 0.0]])
@@ -301,15 +304,373 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
         out_shape_id=ids,
         out_normal=normal,
         out_truncated=truncated,
-        max_alpha_rejections=8,
+        out_alpha_rejections=rejections,
+        max_alpha_rejections=2,
     )
     np.testing.assert_array_equal(truncated.numpy(), [0])
+    np.testing.assert_array_equal(rejections.numpy(), [2])
     np.testing.assert_array_equal(ids.numpy(), [shape])
     np.testing.assert_allclose(dist.numpy(), [2.2], atol=1.0e-5)
 
+    # A zero budget reports truncation at the first transparent candidate
+    # without counting a rejection beyond the bound.
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_dist=dist,
+        out_shape_id=ids,
+        out_normal=normal,
+        out_truncated=truncated,
+        out_alpha_rejections=rejections,
+        max_alpha_rejections=0,
+    )
+    np.testing.assert_array_equal(truncated.numpy(), [1])
+    np.testing.assert_array_equal(rejections.numpy(), [0])
+    np.testing.assert_array_equal(dist.numpy(), [-1.0])
+    np.testing.assert_array_equal(ids.numpy(), [-1])
+    np.testing.assert_array_equal(normal.numpy(), [[0.0, 0.0, 0.0]])
+
+
+def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, device: str):
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    shape = builder.add_shape_mesh(-1, mesh=_layered_mesh([(0, False), (-0.1, False), (-0.2, False), (-0.3, True)]))
+    builder.end_world()
+    model = builder.finalize(device=device)
+
+    # The rays see three, two, one, and zero transparent layers before an
+    # opaque hit; then an empty miss, a miss after one rejection, and a
+    # disabled ray which would otherwise see all three layers.
+    origins = wp.array(
+        [
+            [0.1, 0, 2],
+            [0.1, 0, -0.05],
+            [0.1, 0, -0.15],
+            [0.1, 0, -0.25],
+            [2, 0, 2],
+            [0.1, 0, -0.05],
+            [0.1, 0, 2],
+        ],
+        dtype=wp.vec3f,
+        device=device,
+    )
+    directions = wp.array([[0, 0, -1]] * 5 + [[0, 0, 1], [0, 0, -1]], dtype=wp.vec3f, device=device)
+    worlds = wp.array([0] * 7, dtype=wp.int32, device=device)
+    enabled = wp.array([True] * 6 + [False], dtype=wp.bool, device=device)
+    dist = wp.full(7, 99.0, dtype=wp.float32, device=device)
+    ids = wp.full(7, 99, dtype=wp.int32, device=device)
+    normal = wp.full(7, wp.vec3f(1.0, 1.0, 1.0), dtype=wp.vec3f, device=device)
+    truncated = wp.full(7, 99, dtype=wp.int32, device=device)
+    rejections = wp.full(7, 99, dtype=wp.int32, device=device)
+
+    def cast(budget=8):
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            ray_enabled=enabled,
+            out_dist=dist,
+            out_shape_id=ids,
+            out_normal=normal,
+            out_truncated=truncated,
+            out_alpha_rejections=rejections,
+            max_alpha_rejections=budget,
+        )
+
+    def reset():
+        dist.fill_(99.0)
+        ids.fill_(99)
+        normal.fill_(wp.vec3f(1.0, 1.0, 1.0))
+        truncated.fill_(99)
+        rejections.fill_(99)
+
+    def check():
+        np.testing.assert_array_equal(rejections.numpy(), [3, 2, 1, 0, 0, 1, 0])
+        np.testing.assert_array_equal(truncated.numpy(), [0] * 7)
+        np.testing.assert_array_equal(ids.numpy(), [shape, shape, shape, shape, -1, -1, -1])
+        np.testing.assert_allclose(dist.numpy(), [2.3, 0.25, 0.15, 0.05, -1, -1, -1], atol=1.0e-5)
+        np.testing.assert_array_equal(normal.numpy()[[4, 5, 6]], np.zeros((3, 3), dtype=np.float32))
+
+    cast()
+    check()
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast()
+        reset()
+        wp.capture_launch(capture.graph)
+        check()
+        original_enabled = wp.array([True] * 6 + [False], dtype=wp.bool, device=device)
+        enabled.fill_(True)
+        reset()
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(rejections.numpy(), [3, 2, 1, 0, 0, 1, 3])
+        np.testing.assert_array_equal(truncated.numpy(), [0] * 7)
+        test.assertEqual(int(ids.numpy()[6]), shape)
+        np.testing.assert_allclose(dist.numpy()[6], 2.3, atol=1.0e-5)
+        wp.copy(enabled, original_enabled)
+        reset()
+        wp.capture_launch(capture.graph)
+        check()
+
+    # Omitting the optional output must not alter any existing result.
+    dist_without = wp.empty(7, dtype=wp.float32, device=device)
+    ids_without = wp.empty(7, dtype=wp.int32, device=device)
+    normal_without = wp.empty(7, dtype=wp.vec3f, device=device)
+    truncated_without = wp.empty(7, dtype=wp.int32, device=device)
+
+    def check_omitted(budget):
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            ray_enabled=enabled,
+            out_dist=dist_without,
+            out_shape_id=ids_without,
+            out_normal=normal_without,
+            out_truncated=truncated_without,
+            max_alpha_rejections=budget,
+        )
+        np.testing.assert_array_equal(dist_without.numpy(), dist.numpy())
+        np.testing.assert_array_equal(ids_without.numpy(), ids.numpy())
+        np.testing.assert_array_equal(normal_without.numpy(), normal.numpy())
+        np.testing.assert_array_equal(truncated_without.numpy(), truncated.numpy())
+
+    check_omitted(8)
+
+    # At a lower bound, only the first ray exhausts its budget. The count on
+    # that ray includes the rejection that reached the bound.
+    def check_limited():
+        np.testing.assert_array_equal(rejections.numpy(), [2, 2, 1, 0, 0, 1, 0])
+        np.testing.assert_array_equal(truncated.numpy(), [1, 0, 0, 0, 0, 0, 0])
+        np.testing.assert_array_equal(ids.numpy(), [-1, shape, shape, shape, -1, -1, -1])
+        np.testing.assert_allclose(dist.numpy(), [-1, 0.25, 0.15, 0.05, -1, -1, -1], atol=1.0e-5)
+        np.testing.assert_array_equal(normal.numpy()[[0, 4, 5, 6]], np.zeros((4, 3), dtype=np.float32))
+
+    cast(2)
+    check_limited()
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast(2)
+        reset()
+        wp.capture_launch(capture.graph)
+        check_limited()
+    check_omitted(2)
+
+
+def test_alpha_continuation_rejects_rounded_self_hit_once(test: TestRayOpacity, device: str):
+    # Advancing the ray parameter by just one ULP rounded the origin back onto
+    # the transparent z=-0.2 triangle and exhausted this one-rejection budget.
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    shape = builder.add_shape_mesh(-1, mesh=_layered_mesh([(0, False), (-0.1, False), (-0.2, False), (-0.3, True)]))
+    builder.end_world()
+    model = builder.finalize(device=device)
+    origins = wp.array([[0.1, 0, -0.15]], dtype=wp.vec3f, device=device)
+    directions = wp.array([[0, 0, -1]], dtype=wp.vec3f, device=device)
+    worlds = wp.array([0], dtype=wp.int32, device=device)
+    dist = wp.empty(1, dtype=wp.float32, device=device)
+    ids = wp.empty(1, dtype=wp.int32, device=device)
+    truncated = wp.empty(1, dtype=wp.int32, device=device)
+    rejections = wp.empty(1, dtype=wp.int32, device=device)
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_dist=dist,
+        out_shape_id=ids,
+        out_truncated=truncated,
+        out_alpha_rejections=rejections,
+        max_alpha_rejections=1,
+    )
+    np.testing.assert_array_equal(rejections.numpy(), [1])
+    np.testing.assert_array_equal(truncated.numpy(), [0])
+    np.testing.assert_allclose(dist.numpy(), [0.15], atol=1.0e-5)
+    np.testing.assert_array_equal(ids.numpy(), [shape])
+
+    # The shared traversal is also used by the camera's depth-only and
+    # full-output paths.
+    camera = SensorCamera(model)
+    state = model.state()
+    poses = _transforms(1, device)
+    camera_rays = np.zeros((1, 1, 1, 2, 3), dtype=np.float32)
+    camera_rays[0, 0, 0, 0] = (0.1, 0.0, -0.15)
+    camera_rays[0, 0, 0, 1] = (0.0, 0.0, -1.0)
+    camera_rays = wp.array(camera_rays, dtype=wp.vec3f, device=device)
+    depth = camera.allocate_image_depth(1, 1, 1)
+    shape_image = camera.allocate_image_shape_index(1, 1, 1)
+    status = wp.empty((1, 1, 1), dtype=wp.int32, device=device)
+    config = SensorCamera.RenderConfig(max_alpha_rejections=1)
+    for full_output in (False, True):
+        with test.subTest(full_output=full_output):
+            outputs = {"depth_image": depth}
+            if full_output:
+                outputs["shape_index_image"] = shape_image
+            camera.update(
+                state,
+                poses,
+                camera_rays,
+                **outputs,
+                alpha_truncated_image=status,
+                render_config=config,
+            )
+            np.testing.assert_array_equal(status.numpy(), [[[0]]])
+            np.testing.assert_allclose(depth.numpy(), [[[0.15]]], atol=1.0e-5)
+            if full_output:
+                test.assertEqual(int(shape_image.numpy()[0, 0, 0]), shape)
+
+
+def test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera(test: TestRayOpacity, device: str):
+    # At a grazing angle the position-space advance changes x but rounds z
+    # back to the rejected plane, even after four doublings.
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    builder.add_shape_mesh(-1, mesh=_layered_mesh([(-0.2, False)]))
+    builder.end_world()
+    model = builder.finalize(device=device)
+    origin = (-0.5245203375816345, -0.18875321745872498, -0.1999979019165039)
+    direction = (1.0, 0.0, -2.5971164632210275e-6)
+    origins = wp.array([origin], dtype=wp.vec3f, device=device)
+    directions = wp.array([direction], dtype=wp.vec3f, device=device)
+    worlds = wp.array([0], dtype=wp.int32, device=device)
+    dist = wp.empty(1, dtype=wp.float32, device=device)
+    ids = wp.empty(1, dtype=wp.int32, device=device)
+    truncated = wp.empty(1, dtype=wp.int32, device=device)
+    rejections = wp.empty(1, dtype=wp.int32, device=device)
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_dist=dist,
+        out_shape_id=ids,
+        out_truncated=truncated,
+        out_alpha_rejections=rejections,
+        max_alpha_rejections=8,
+    )
+    np.testing.assert_array_equal(rejections.numpy(), [1])
+    np.testing.assert_array_equal(truncated.numpy(), [1])
+    np.testing.assert_array_equal(dist.numpy(), [-1.0])
+    np.testing.assert_array_equal(ids.numpy(), [-1])
+
+    camera = SensorCamera(model)
+    camera_rays = np.zeros((1, 1, 1, 2, 3), dtype=np.float32)
+    camera_rays[0, 0, 0, 0] = origin
+    camera_rays[0, 0, 0, 1] = direction
+    camera_rays = wp.array(camera_rays, dtype=wp.vec3f, device=device)
+    depth = camera.allocate_image_depth(1, 1, 1)
+    shape_image = camera.allocate_image_shape_index(1, 1, 1)
+    status = wp.empty((1, 1, 1), dtype=wp.int32, device=device)
+    for full_output in (False, True):
+        with test.subTest(full_output=full_output):
+            outputs = {"depth_image": depth}
+            if full_output:
+                outputs["shape_index_image"] = shape_image
+            camera.update(
+                model.state(),
+                _transforms(1, device),
+                camera_rays,
+                **outputs,
+                alpha_truncated_image=status,
+                render_config=SensorCamera.RenderConfig(max_alpha_rejections=8),
+            )
+            np.testing.assert_array_equal(status.numpy(), [[[1]]])
+
+
+def test_alpha_continuation_uses_world_distance_with_scaled_mesh(test: TestRayOpacity, device: str):
+    rotation = wp.quat_from_axis_angle(wp.vec3(0, 1, 0), wp.pi / 2)
+    xform = wp.transform(wp.vec3(3, -2, 4), rotation)
+    for scale_z in (0.25, 4.0):
+        with test.subTest(scale_z=scale_z):
+            builder = newton.ModelBuilder()
+            builder.begin_world()
+            shape = builder.add_shape_mesh(
+                -1,
+                mesh=_layered_mesh([(0, False), (-0.1, False), (-0.2, False), (-0.3, True)]),
+                xform=xform,
+                scale=(2.0, 0.5, scale_z),
+            )
+            builder.end_world()
+            model = builder.finalize(device=device)
+            # After the 90-degree rotation, local -z is world -x. The local
+            # direction magnitudes are 4 and 0.25 for the two mesh scales.
+            origins = wp.array(
+                [[3 - 0.15 * scale_z, -2, 3.8], [3 + 2 * scale_z, -2, 3.8]],
+                dtype=wp.vec3f,
+                device=device,
+            )
+            directions = wp.array([[-1, 0, 0], [-1, 0, 0]], dtype=wp.vec3f, device=device)
+            worlds = wp.array([0, 0], dtype=wp.int32, device=device)
+            dist = wp.empty(2, dtype=wp.float32, device=device)
+            ids = wp.empty(2, dtype=wp.int32, device=device)
+            truncated = wp.empty(2, dtype=wp.int32, device=device)
+            rejections = wp.empty(2, dtype=wp.int32, device=device)
+            for budget, counts, exhausted, distances, shapes in (
+                (3, [1, 3], [0, 0], [0.15 * scale_z, 2.3 * scale_z], [shape, shape]),
+                (1, [1, 1], [0, 1], [0.15 * scale_z, -1.0], [shape, -1]),
+            ):
+                with test.subTest(budget=budget):
+                    newton.intersect_ray(
+                        model,
+                        ray_origins=origins,
+                        ray_directions=directions,
+                        ray_worlds=worlds,
+                        out_dist=dist,
+                        out_shape_id=ids,
+                        out_truncated=truncated,
+                        out_alpha_rejections=rejections,
+                        max_alpha_rejections=budget,
+                    )
+                    np.testing.assert_array_equal(rejections.numpy(), counts)
+                    np.testing.assert_array_equal(truncated.numpy(), exhausted)
+                    np.testing.assert_allclose(dist.numpy(), distances, atol=1.0e-5, rtol=0)
+                    np.testing.assert_array_equal(ids.numpy(), shapes)
+
+
+def test_alpha_rejection_counts_across_shapes_and_worlds(test: TestRayOpacity, device: str):
+    builder = newton.ModelBuilder()
+    global_shape = builder.add_shape_mesh(-1, mesh=_layered_mesh([(-0.2, False), (-0.3, True)]))
+    builder.begin_world()
+    builder.add_shape_mesh(-1, mesh=_layered_mesh([(0, False)]))
+    builder.add_shape_mesh(-1, mesh=_layered_mesh([(-0.1, False)]))
+    builder.end_world()
+    model = builder.finalize(device=device)
+    origins = wp.array([[0.1, 0, 2]], dtype=wp.vec3f, device=device)
+    directions = wp.array([[0, 0, -1]], dtype=wp.vec3f, device=device)
+    worlds = wp.array([0], dtype=wp.int32, device=device)
+    dist = wp.empty(1, dtype=wp.float32, device=device)
+    ids = wp.empty(1, dtype=wp.int32, device=device)
+    truncated = wp.empty(1, dtype=wp.int32, device=device)
+    rejections = wp.empty(1, dtype=wp.int32, device=device)
+
+    for budget, expected_count, expected_truncated, expected_dist, expected_shape in (
+        (2, 2, 1, -1.0, -1),
+        (3, 3, 0, 2.3, global_shape),
+    ):
+        with test.subTest(budget=budget):
+            newton.intersect_ray(
+                model,
+                ray_origins=origins,
+                ray_directions=directions,
+                ray_worlds=worlds,
+                out_dist=dist,
+                out_shape_id=ids,
+                out_truncated=truncated,
+                out_alpha_rejections=rejections,
+                max_alpha_rejections=budget,
+            )
+            np.testing.assert_array_equal(rejections.numpy(), [expected_count])
+            np.testing.assert_array_equal(truncated.numpy(), [expected_truncated])
+            np.testing.assert_allclose(dist.numpy(), [expected_dist], atol=1.0e-5)
+            np.testing.assert_array_equal(ids.numpy(), [expected_shape])
+
 
 def test_alpha_continuation_resolves_known_small_gap(test: TestRayOpacity, device: str):
-    # The gap is 0.1 mm (> 8 ULP at 100 m), well below a LiDAR's cm precision.
+    # At 100 m, the rounded advance is about 38.1 µm, below this 100 µm gap.
     gap = 0.0001
     builder = newton.ModelBuilder()
     builder.begin_world()
@@ -321,6 +682,7 @@ def test_alpha_continuation_resolves_known_small_gap(test: TestRayOpacity, devic
     worlds = wp.array([0, 0], dtype=wp.int32, device=device)
     dist = wp.empty(2, dtype=wp.float32, device=device)
     truncated = wp.empty(2, dtype=wp.int32, device=device)
+    rejections = wp.empty(2, dtype=wp.int32, device=device)
     newton.intersect_ray(
         model,
         ray_origins=origins,
@@ -328,8 +690,10 @@ def test_alpha_continuation_resolves_known_small_gap(test: TestRayOpacity, devic
         ray_worlds=worlds,
         out_dist=dist,
         out_truncated=truncated,
+        out_alpha_rejections=rejections,
     )
     np.testing.assert_array_equal(truncated.numpy(), [0, 0])
+    np.testing.assert_array_equal(rejections.numpy(), [1, 1])
     np.testing.assert_allclose(dist.numpy(), [20.0 + gap, 100.0 + gap], atol=1.0e-5, rtol=0)
 
 
@@ -460,6 +824,36 @@ add_function_test(
     TestRayOpacity,
     "test_alpha_budget_fails_closed_and_reports_each_ray",
     test_alpha_budget_fails_closed_and_reports_each_ray,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_alpha_rejection_counts_per_ray_and_graph_capture",
+    test_alpha_rejection_counts_per_ray_and_graph_capture,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_alpha_continuation_rejects_rounded_self_hit_once",
+    test_alpha_continuation_rejects_rounded_self_hit_once,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera",
+    test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_alpha_continuation_uses_world_distance_with_scaled_mesh",
+    test_alpha_continuation_uses_world_distance_with_scaled_mesh,
+    devices=devices,
+)
+add_function_test(
+    TestRayOpacity,
+    "test_alpha_rejection_counts_across_shapes_and_worlds",
+    test_alpha_rejection_counts_across_shapes_and_worlds,
     devices=devices,
 )
 add_function_test(
