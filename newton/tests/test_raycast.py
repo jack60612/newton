@@ -731,6 +731,207 @@ def test_intersect_ray(test: TestRaycast, device: str):
     )
 
 
+def test_intersect_ray_face_ids(test: TestRaycast, device: str):
+    """Face IDs follow the closest shape across world passes and graph replays."""
+    quad = newton.Mesh(
+        np.array([[-1, -1, 0], [1, -1, 0], [1, 1, 0], [-1, 1, 0]], dtype=np.float32),
+        np.array([0, 1, 2, 0, 2, 3], dtype=np.int32),
+        compute_inertia=False,
+    )
+    builder = newton.ModelBuilder()
+    global_mesh = builder.add_shape_mesh(-1, mesh=quad, xform=wp.transform(wp.vec3(4.0, 0.0, 0.0), wp.quat_identity()))
+    global_sphere = builder.add_shape_sphere(
+        -1, radius=0.25, xform=wp.transform(wp.vec3(0.5, -0.5, 1.0), wp.quat_identity())
+    )
+    builder.begin_world()
+    world_mesh = builder.add_shape_mesh(-1, mesh=quad)
+    world_sphere = builder.add_shape_sphere(
+        -1, radius=0.25, xform=wp.transform(wp.vec3(4.5, -0.5, -1.0), wp.quat_identity())
+    )
+    builder.end_world()
+    model = builder.finalize(device=device)
+
+    origins = wp.array(
+        [
+            [0.5, 0.0, 2.0],  # world mesh, face 0
+            [-0.5, 0.0, 2.0],  # world mesh, face 1
+            [0.5, -0.5, 2.0],  # global sphere replaces a world mesh hit
+            [4.5, -0.5, 2.0],  # global mesh replaces a world sphere hit
+            [3.5, 0.0, 2.0],  # global mesh, face 1
+            [10.0, 0.0, 2.0],  # miss
+            [0.5, 0.0, 2.0],  # disabled mesh hit
+            [0.5, -0.5, -2.0],  # back of world mesh, ahead of global sphere
+            [4.5, -0.5, -2.0],  # world sphere, ahead of global mesh
+        ],
+        dtype=wp.vec3,
+        device=device,
+    )
+    directions = wp.array([[0, 0, -1]] * 7 + [[0, 0, 1]] * 2, dtype=wp.vec3, device=device)
+    worlds = wp.array([0] * 9, dtype=wp.int32, device=device)
+    enabled = wp.array([True] * 6 + [False, True, True], dtype=wp.bool, device=device)
+    original_enabled = wp.array([True] * 6 + [False, True, True], dtype=wp.bool, device=device)
+    dist = wp.empty(9, dtype=wp.float32, device=device)
+    shapes = wp.empty(9, dtype=wp.int32, device=device)
+    faces = wp.empty(9, dtype=wp.int32, device=device)
+    normals = wp.empty(9, dtype=wp.vec3, device=device)
+    truncated = wp.empty(9, dtype=wp.int32, device=device)
+    rejections = wp.empty(9, dtype=wp.int32, device=device)
+    dist_without = wp.empty_like(dist)
+    shapes_without = wp.empty_like(shapes)
+    normals_without = wp.empty_like(normals)
+    truncated_without = wp.empty_like(truncated)
+    rejections_without = wp.empty_like(rejections)
+
+    def cast():
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            ray_enabled=enabled,
+            out_dist=dist,
+            out_shape_id=shapes,
+            out_face_id=faces,
+            out_normal=normals,
+            out_truncated=truncated,
+            out_alpha_rejections=rejections,
+        )
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            ray_enabled=enabled,
+            out_dist=dist_without,
+            out_shape_id=shapes_without,
+            out_normal=normals_without,
+            out_truncated=truncated_without,
+            out_alpha_rejections=rejections_without,
+        )
+
+    def check(enabled_hit=False):
+        expected_shapes = [
+            world_mesh,
+            world_mesh,
+            global_sphere,
+            global_mesh,
+            global_mesh,
+            -1,
+            world_mesh if enabled_hit else -1,
+            world_mesh,
+            world_sphere,
+        ]
+        expected_faces = [0, 1, -1, 0, 1, -1, 0 if enabled_hit else -1, 0, -1]
+        expected_dist = [2.0, 2.0, 0.75, 2.0, 2.0, -1.0, 2.0 if enabled_hit else -1.0, 2.0, 0.75]
+        np.testing.assert_array_equal(shapes.numpy(), expected_shapes)
+        np.testing.assert_array_equal(faces.numpy(), expected_faces)
+        np.testing.assert_allclose(dist.numpy(), expected_dist, atol=1.0e-5)
+        np.testing.assert_array_equal(truncated.numpy(), np.zeros(9, dtype=np.int32))
+        np.testing.assert_array_equal(rejections.numpy(), np.zeros(9, dtype=np.int32))
+        for actual, without in (
+            (dist, dist_without),
+            (shapes, shapes_without),
+            (normals, normals_without),
+            (truncated, truncated_without),
+            (rejections, rejections_without),
+        ):
+            np.testing.assert_array_equal(actual.numpy(), without.numpy())
+
+    def reset():
+        for output in (
+            dist,
+            shapes,
+            faces,
+            truncated,
+            rejections,
+            dist_without,
+            shapes_without,
+            truncated_without,
+            rejections_without,
+        ):
+            output.fill_(99)
+        normals.fill_(wp.vec3(1.0, 1.0, 1.0))
+        normals_without.fill_(wp.vec3(1.0, 1.0, 1.0))
+
+    cast()
+    check()
+    face_only = wp.full(9, 99, dtype=wp.int32, device=device)
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        ray_enabled=enabled,
+        out_face_id=face_only,
+    )
+    np.testing.assert_array_equal(face_only.numpy(), faces.numpy())
+
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast()
+        enabled.fill_(True)
+        reset()
+        wp.capture_launch(capture.graph)
+        check(enabled_hit=True)
+        wp.copy(enabled, original_enabled)
+        reset()
+        wp.capture_launch(capture.graph)
+        check()
+
+
+def test_intersect_ray_convex_mesh_face_ids(test: TestRaycast, device: str):
+    vertices = np.array(
+        [
+            [-1, -1, 0],
+            [1, -1, 0],
+            [1, 1, 0],
+            [-1, 1, 0],
+            [-1, -1, -1],
+            [1, -1, -1],
+            [1, 1, -1],
+            [-1, 1, -1],
+        ],
+        dtype=np.float32,
+    )
+    indices = np.array(
+        [
+            [0, 1, 2],
+            [0, 2, 3],
+            [4, 6, 5],
+            [4, 7, 6],
+            [0, 4, 5],
+            [0, 5, 1],
+            [1, 5, 6],
+            [1, 6, 2],
+            [2, 6, 7],
+            [2, 7, 3],
+            [3, 7, 4],
+            [3, 4, 0],
+        ],
+        dtype=np.int32,
+    ).flatten()
+    builder = newton.ModelBuilder()
+    builder.begin_world()
+    shape = builder.add_shape_convex_hull(-1, mesh=newton.Mesh(vertices, indices, compute_inertia=False))
+    builder.end_world()
+    model = builder.finalize(device=device)
+    origins = wp.array([[0.5, 0.0, 2.0], [-0.5, 0.0, 2.0]], dtype=wp.vec3, device=device)
+    directions = wp.array([[0.0, 0.0, -1.0]] * 2, dtype=wp.vec3, device=device)
+    worlds = wp.array([0, 0], dtype=wp.int32, device=device)
+    shapes = wp.empty(2, dtype=wp.int32, device=device)
+    faces = wp.empty(2, dtype=wp.int32, device=device)
+    newton.intersect_ray(
+        model,
+        ray_origins=origins,
+        ray_directions=directions,
+        ray_worlds=worlds,
+        out_shape_id=shapes,
+        out_face_id=faces,
+    )
+    np.testing.assert_array_equal(shapes.numpy(), [shape, shape])
+    np.testing.assert_array_equal(faces.numpy(), [0, 1])
+
+
 def _make_global_world_model(device: str):
     """Two worlds each with a sphere, plus a global-world box shared by both."""
     builder = newton.ModelBuilder()
@@ -805,11 +1006,12 @@ def test_intersect_ray_heightfield_uses_finalize_bvh(test: TestRaycast, device: 
 
     test.assertEqual(model.bvh_shape_count_enabled, 1)
 
-    origins = wp.array(np.array([[0.0, 0.0, 2.0]], dtype=np.float32), dtype=wp.vec3, device=device)
-    directions = wp.array(np.array([[0.0, 0.0, -1.0]], dtype=np.float32), dtype=wp.vec3, device=device)
-    worlds = wp.array(np.array([0], dtype=np.int32), dtype=wp.int32, device=device)
-    out_dist = wp.empty(shape=1, dtype=float, device=device)
-    out_shape_id = wp.empty(shape=1, dtype=wp.int32, device=device)
+    origins = wp.array([[-0.5, -0.5, 2.0], [0.5, 0.5, 2.0]], dtype=wp.vec3, device=device)
+    directions = wp.array([[0.0, 0.0, -1.0]] * 2, dtype=wp.vec3, device=device)
+    worlds = wp.array([0, 0], dtype=wp.int32, device=device)
+    out_dist = wp.empty(shape=2, dtype=float, device=device)
+    out_shape_id = wp.empty(shape=2, dtype=wp.int32, device=device)
+    out_face_id = wp.empty(shape=2, dtype=wp.int32, device=device)
 
     newton.intersect_ray(
         model,
@@ -818,10 +1020,12 @@ def test_intersect_ray_heightfield_uses_finalize_bvh(test: TestRaycast, device: 
         ray_worlds=worlds,
         out_dist=out_dist,
         out_shape_id=out_shape_id,
+        out_face_id=out_face_id,
     )
 
-    np.testing.assert_allclose(out_dist.numpy(), np.array([2.0], dtype=np.float32), atol=1e-5)
-    np.testing.assert_array_equal(out_shape_id.numpy(), np.array([shape_id], dtype=np.int32))
+    np.testing.assert_allclose(out_dist.numpy(), np.array([2.0, 2.0], dtype=np.float32), atol=1e-5)
+    np.testing.assert_array_equal(out_shape_id.numpy(), np.array([shape_id, shape_id], dtype=np.int32))
+    np.testing.assert_array_equal(out_face_id.numpy(), np.array([-1, -1], dtype=np.int32))
 
 
 def test_intersect_ray_heightfield_flat_at_min_z(test: TestRaycast, device: str):
@@ -948,6 +1152,10 @@ add_function_test(
     devices=devices,
 )
 add_function_test(TestRaycast, "test_intersect_ray", test_intersect_ray, devices=devices)
+add_function_test(TestRaycast, "test_intersect_ray_face_ids", test_intersect_ray_face_ids, devices=devices)
+add_function_test(
+    TestRaycast, "test_intersect_ray_convex_mesh_face_ids", test_intersect_ray_convex_mesh_face_ids, devices=devices
+)
 add_function_test(TestRaycast, "test_intersect_ray_global_world", test_intersect_ray_global_world, devices=devices)
 add_function_test(
     TestRaycast,
@@ -1018,6 +1226,7 @@ def test_intersect_ray_misses_when_no_shape_is_selected(test: TestRaycast, devic
     worlds = wp.array(np.array([-1], dtype=np.int32), dtype=wp.int32, device=device)
     out_dist = wp.full(shape=1, value=5.0, dtype=float, device=device)
     out_shape_id = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
+    out_face_id = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
     out_normal = wp.full(shape=1, value=wp.vec3(1.0, 1.0, 1.0), dtype=wp.vec3, device=device)
     out_truncated = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
     out_alpha_rejections = wp.full(shape=1, value=7, dtype=wp.int32, device=device)
@@ -1030,6 +1239,7 @@ def test_intersect_ray_misses_when_no_shape_is_selected(test: TestRaycast, devic
             ray_worlds=worlds,
             out_dist=out_dist,
             out_shape_id=out_shape_id,
+            out_face_id=out_face_id,
             out_normal=out_normal,
             out_truncated=out_truncated,
             out_alpha_rejections=out_alpha_rejections,
@@ -1038,6 +1248,7 @@ def test_intersect_ray_misses_when_no_shape_is_selected(test: TestRaycast, devic
     def check():
         np.testing.assert_array_equal(out_dist.numpy(), np.array([-1.0], dtype=np.float32))
         np.testing.assert_array_equal(out_shape_id.numpy(), np.array([-1], dtype=np.int32))
+        np.testing.assert_array_equal(out_face_id.numpy(), np.array([-1], dtype=np.int32))
         np.testing.assert_array_equal(out_normal.numpy(), np.zeros((1, 3), dtype=np.float32))
         np.testing.assert_array_equal(out_truncated.numpy(), np.array([0], dtype=np.int32))
         np.testing.assert_array_equal(out_alpha_rejections.numpy(), np.array([0], dtype=np.int32))
@@ -1049,6 +1260,7 @@ def test_intersect_ray_misses_when_no_shape_is_selected(test: TestRaycast, devic
             cast()
         out_dist.fill_(5.0)
         out_shape_id.fill_(7)
+        out_face_id.fill_(7)
         out_normal.fill_(wp.vec3(1.0, 1.0, 1.0))
         out_truncated.fill_(7)
         out_alpha_rejections.fill_(7)
