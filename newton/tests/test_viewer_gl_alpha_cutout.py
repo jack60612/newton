@@ -11,7 +11,32 @@ import warp as wp
 
 import newton
 from newton._src.viewer.gl.opengl import MeshInstancerGL, RendererGL
+from newton._src.viewer.gl.shaders import shape_fragment_shader
 from newton.tests.test_viewer_get_frame import _make_headless_viewer_gl_or_skip
+
+
+class TestViewerGLAlphaDerivativeOrder(unittest.TestCase):
+    def test_derivatives_precede_nonuniform_cutout(self):
+        # Source-level invariant: derivatives after discard, or inside a
+        # per-fragment material branch, are undefined even when a particular
+        # driver happens to render a test scene consistently.
+        main = shape_fragment_shader.split("void main()\n{", 1)[1]
+        cutout = main.index("apply_alpha_cutout(TexCoord, Opacity, Cutout)")
+        for expression in (
+            "dFdx(TexCoord)",
+            "dFdy(TexCoord)",
+            "filterwidth(checker_uv)",
+            "dFdx(camera_to_fragment)",
+            "dFdy(camera_to_fragment)",
+        ):
+            with self.subTest(expression=expression):
+                self.assertLess(main.index(expression), cutout)
+        self.assertIn("textureGrad(albedo_map, TexCoord, tex_dx, tex_dy)", main)
+        shadow = shape_fragment_shader.split("float ShadowCalculation(", 1)[1].split("float SpotlightAttenuation(", 1)[
+            0
+        ]
+        self.assertNotIn("dFdx(", shadow)
+        self.assertNotIn("dFdy(", shadow)
 
 
 class TestViewerGLAlphaCutout(unittest.TestCase):
@@ -126,6 +151,28 @@ class TestViewerGLAlphaCutout(unittest.TestCase):
         self.assertTrue(np.all(shadow_cut <= shadow_opaque))
         prototype = self.viewer.objects["/cutout/card"]
         self.assertIs(prototype.opacity_texture_id, prototype.texture_id)
+
+    def test_cutout_keeps_mipmapped_albedo_of_surviving_fragments(self):
+        self.viewer.renderer.draw_shadows = False
+        rows, cols = np.indices((64, 64))
+        texture = np.empty((64, 64, 4), dtype=np.uint8)
+        texture[..., 0] = np.where((rows + cols) % 2, 255, 0)
+        texture[..., 1] = np.where((rows + cols) % 2, 32, 224)
+        texture[..., 2] = np.where((rows + cols) % 2, 192, 48)
+        texture[..., 3] = np.where((rows // 8 + cols // 8) % 2, 255, 0)
+        uvs = np.array([(0.0, 0.0), (4.0, 0.0), (4.0, 4.0), (0.0, 4.0)], dtype=np.float32)
+
+        self._log_card(self._source(uvs=uvs, texture=texture, double_sided=True))
+        opaque_color, opaque_depth, _ = self._frame()
+        self._log_card(
+            self._source(uvs=uvs, texture=texture, opacity_texture=texture, opacity_threshold=0.5, double_sided=True)
+        )
+        cut_color, cut_depth, _ = self._frame()
+        kept = np.flipud(cut_depth < 1.0)
+        opaque = np.flipud(opaque_depth < 1.0)
+        self.assertGreater(np.count_nonzero(kept), 100)
+        self.assertGreater(np.count_nonzero(opaque & ~kept), 100)
+        np.testing.assert_array_equal(cut_color[kept], opaque_color[kept])
 
     def test_bilinear_repeat_and_scalar_threshold(self):
         def visible(uv, *, threshold=0.5, opacity_texture=True, opacity=1.0):
