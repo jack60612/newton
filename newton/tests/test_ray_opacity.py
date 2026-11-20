@@ -597,22 +597,35 @@ def test_alpha_continuation_rejects_rounded_self_hit_once(test: TestRayOpacity, 
 
 
 def test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera(test: TestRayOpacity, device: str):
-    # At a grazing angle the position-space advance changes x but rounds z
-    # back to the rejected plane, even after four doublings.
+    """Require real same-face retry exhaustion to fail closed in raycast and camera paths."""
+    # A grazing hit can round its continuation origin back onto the same
+    # transparent face. Fused arithmetic and ray/triangle rounding differ by
+    # device, so select a reproducing ray on the device under test from a
+    # deterministic family of real near-coplanar rays. The mesh has one
+    # transparent quad and the alpha budget is eight: truncation after exactly
+    # one rejection therefore exercises the same-face retry bound, not the
+    # rejection-count bound.
+    rng = np.random.default_rng(20261119)
+    count = 8192
+    directions_np = np.zeros((count, 3), dtype=np.float32)
+    directions_np[:, 0] = 1.0
+    directions_np[:, 2] = -np.exp2(rng.uniform(-26.0, -12.0, count))
+    origins_np = np.empty((count, 3), dtype=np.float32)
+    origins_np[:, 0] = rng.uniform(-0.95, -0.70, count)
+    origins_np[:, 1] = rng.uniform(-0.19, -0.09, count)
+    origins_np[:, 2] = np.float32(-0.2) - directions_np[:, 2] * rng.uniform(0.01, 0.35, count)
     builder = newton.ModelBuilder()
     builder.begin_world()
     builder.add_shape_mesh(-1, mesh=_layered_mesh([(-0.2, False)]))
     builder.end_world()
     model = builder.finalize(device=device)
-    origin = (-0.5245203375816345, -0.18875321745872498, -0.1999979019165039)
-    direction = (1.0, 0.0, -2.5971164632210275e-6)
-    origins = wp.array([origin], dtype=wp.vec3f, device=device)
-    directions = wp.array([direction], dtype=wp.vec3f, device=device)
-    worlds = wp.array([0], dtype=wp.int32, device=device)
-    dist = wp.empty(1, dtype=wp.float32, device=device)
-    ids = wp.empty(1, dtype=wp.int32, device=device)
-    truncated = wp.empty(1, dtype=wp.int32, device=device)
-    rejections = wp.empty(1, dtype=wp.int32, device=device)
+    origins = wp.array(origins_np, dtype=wp.vec3f, device=device)
+    directions = wp.array(directions_np, dtype=wp.vec3f, device=device)
+    worlds = wp.zeros(count, dtype=wp.int32, device=device)
+    dist = wp.empty(count, dtype=wp.float32, device=device)
+    ids = wp.empty(count, dtype=wp.int32, device=device)
+    truncated = wp.empty(count, dtype=wp.int32, device=device)
+    rejections = wp.empty(count, dtype=wp.int32, device=device)
     newton.intersect_ray(
         model,
         ray_origins=origins,
@@ -624,10 +637,15 @@ def test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera(test: 
         out_alpha_rejections=rejections,
         max_alpha_rejections=8,
     )
-    np.testing.assert_array_equal(rejections.numpy(), [1])
-    np.testing.assert_array_equal(truncated.numpy(), [1])
-    np.testing.assert_array_equal(dist.numpy(), [-1.0])
-    np.testing.assert_array_equal(ids.numpy(), [-1])
+    rejected = rejections.numpy()
+    truncated_np = truncated.numpy()
+    candidates = np.flatnonzero((rejected == 1) & (truncated_np == 1))
+    test.assertGreater(len(candidates), 0, f"No grazing ray exhausted the same-face retry bound on {device}")
+    np.testing.assert_array_equal(dist.numpy()[candidates], np.full(len(candidates), -1.0, dtype=np.float32))
+    np.testing.assert_array_equal(ids.numpy()[candidates], np.full(len(candidates), -1, dtype=np.int32))
+    selected = int(candidates[0])
+    origin = origins_np[selected]
+    direction = directions_np[selected]
 
     camera = SensorCamera(model)
     camera_rays = np.zeros((1, 1, 1, 2, 3), dtype=np.float32)
@@ -636,6 +654,7 @@ def test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera(test: 
     camera_rays = wp.array(camera_rays, dtype=wp.vec3f, device=device)
     depth = camera.allocate_image_depth(1, 1, 1)
     shape_image = camera.allocate_image_shape_index(1, 1, 1)
+    clear = SensorCamera.ClearData(clear_depth=-3.0, clear_shape_index=12345)
     status = wp.empty((1, 1, 1), dtype=wp.int32, device=device)
     for full_output in (False, True):
         with test.subTest(full_output=full_output):
@@ -647,10 +666,14 @@ def test_alpha_same_face_retry_budget_fails_closed_for_raycast_and_camera(test: 
                 _transforms(1, device),
                 camera_rays,
                 **outputs,
+                clear_data=clear,
                 alpha_truncated_image=status,
                 render_config=SensorCamera.RenderConfig(max_alpha_rejections=8),
             )
             np.testing.assert_array_equal(status.numpy(), [[[1]]])
+            np.testing.assert_array_equal(depth.numpy(), [[[-3.0]]])
+            if full_output:
+                np.testing.assert_array_equal(shape_image.numpy(), [[[12345]]])
 
 
 def test_alpha_continuation_uses_world_distance_with_scaled_mesh(test: TestRayOpacity, device: str):
