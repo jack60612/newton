@@ -934,6 +934,7 @@ def intersect_ray(
     enable_global_world: bool = True,
     out_dist: wp.array[float] | None = None,
     out_shape_id: wp.array[wp.int32] | None = None,
+    out_face_id: wp.array[wp.int32] | None = None,
     out_normal: wp.array[wp.vec3] | None = None,
     out_truncated: wp.array[wp.int32] | None = None,
     out_alpha_rejections: wp.array[wp.int32] | None = None,
@@ -975,7 +976,7 @@ def intersect_ray(
     and coordinate magnitude affect these bounds; nearby intersections can be
     skipped, and there is no universal fixed world-space skip distance.
 
-    ``out_dist``, ``out_shape_id``, ``out_normal``, and
+    ``out_dist``, ``out_shape_id``, ``out_face_id``, ``out_normal``, and
     ``out_alpha_rejections`` are optional outputs. Pass ``None`` to skip
     writing a channel.
 
@@ -991,6 +992,10 @@ def intersect_ray(
         enable_global_world: Whether to enable global world raycasting.
         out_dist: Optional output hit distances [m], shape [ray_count]. ``-1`` on miss.
         out_shape_id: Optional output hit shape indices, shape [ray_count]. ``-1`` on miss.
+        out_face_id: Optional int32 output face indices, shape [ray_count]. The
+            triangle index belongs to the winning MESH or CONVEX_MESH shape.
+            ``-1`` for all other shape types (including HFIELD), misses,
+            disabled rays, and truncated rays.
         out_normal: Optional output hit normals, shape [ray_count, 3].
         out_truncated: Per-ray int32 diagnostic, 1 on exhausted rejection or
             self-hit retry budget, 0 otherwise. Required if the model has
@@ -1015,6 +1020,8 @@ def intersect_ray(
             out_dist.fill_(-1.0)
         if out_shape_id is not None:
             out_shape_id.fill_(-1)
+        if out_face_id is not None:
+            out_face_id.fill_(-1)
         if out_normal is not None:
             out_normal.zero_()
         if out_truncated is not None:
@@ -1033,6 +1040,7 @@ def intersect_ray(
 
     write_dist = out_dist is not None
     write_shape_id = out_shape_id is not None
+    write_face_id = out_face_id is not None
     write_normal = out_normal is not None
     write_truncated = out_truncated is not None
     write_alpha_rejections = out_alpha_rejections is not None
@@ -1062,6 +1070,7 @@ def intersect_ray(
         ray_enabled: wp.array[wp.bool],
         out_dist: wp.array[float],
         out_shape_id: wp.array[wp.int32],
+        out_face_id: wp.array[wp.int32],
         out_normal: wp.array[wp.vec3],
         out_truncated: wp.array[wp.int32],
         out_alpha_rejections: wp.array[wp.int32],
@@ -1073,6 +1082,8 @@ def intersect_ray(
                     out_dist[rayid] = -1.0
                 if wp.static(write_shape_id):
                     out_shape_id[rayid] = -1
+                if wp.static(write_face_id):
+                    out_face_id[rayid] = -1
                 if wp.static(write_normal):
                     out_normal[rayid] = wp.vec3(0.0)
                 if wp.static(write_truncated):
@@ -1086,6 +1097,8 @@ def intersect_ray(
 
         min_dist = float(MAXVAL)
         min_shape_id = wp.int32(-1)
+        if wp.static(write_face_id):
+            min_face_id = wp.int32(-1)
         min_normal = wp.vec3(0.0)
         rejected = wp.int32(0)
         truncated = wp.bool(False)
@@ -1106,6 +1119,7 @@ def intersect_ray(
                     continue
                 shape_id = wp.int32(bvh_shape_enabled[bvh_shape_id])
                 geom_type = shape_type[shape_id]
+                hit_face_id = wp.int32(-1)
 
                 if geom_type == GeoType.MESH or geom_type == GeoType.CONVEX_MESH or geom_type == GeoType.HFIELD:
                     geom_to_world = shape_transform_world[shape_id]
@@ -1115,7 +1129,15 @@ def intersect_ray(
                     if wp.static(has_cutouts):
                         material_id = material_index(shape_id, shape_material, variant_material, shape_variant)
                         if material_id >= 0:
-                            hit_dist, hit_normal_local, _u, _v, _face, count, exhausted = ray_intersect_mesh_cutout(
+                            (
+                                hit_dist,
+                                hit_normal_local,
+                                _u,
+                                _v,
+                                hit_face_id,
+                                count,
+                                exhausted,
+                            ) = ray_intersect_mesh_cutout(
                                 ray_origin_local,
                                 ray_direction_local,
                                 shape_scale[shape_id],
@@ -1131,7 +1153,7 @@ def intersect_ray(
                                 truncated = True
                                 break
                         else:
-                            hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
+                            hit_dist, hit_normal_local, _u, _v, hit_face_id = ray_intersect_mesh(
                                 ray_origin_local,
                                 ray_direction_local,
                                 shape_scale[shape_id],
@@ -1140,7 +1162,7 @@ def intersect_ray(
                                 min_dist,
                             )
                     else:
-                        hit_dist, hit_normal_local, _u, _v, _face = ray_intersect_mesh(
+                        hit_dist, hit_normal_local, _u, _v, hit_face_id = ray_intersect_mesh(
                             ray_origin_local,
                             ray_direction_local,
                             shape_scale[shape_id],
@@ -1163,18 +1185,27 @@ def intersect_ray(
                 if hit_dist >= 0.0 and hit_dist < min_dist:
                     min_dist = hit_dist
                     min_shape_id = shape_id
+                    if wp.static(write_face_id):
+                        if geom_type == GeoType.MESH or geom_type == GeoType.CONVEX_MESH:
+                            min_face_id = hit_face_id
+                        else:
+                            min_face_id = -1
                     min_normal = hit_normal
             if truncated:
                 break
 
         if truncated:
             min_shape_id = -1
+            if wp.static(write_face_id):
+                min_face_id = -1
             min_normal = wp.vec3(0.0)
 
         if wp.static(write_dist):
             out_dist[rayid] = wp.where(min_shape_id < 0, -1.0, min_dist)
         if wp.static(write_shape_id):
             out_shape_id[rayid] = min_shape_id
+        if wp.static(write_face_id):
+            out_face_id[rayid] = min_face_id
         if wp.static(write_normal):
             out_normal[rayid] = min_normal
         if wp.static(write_truncated):
@@ -1206,6 +1237,7 @@ def intersect_ray(
         outputs=[
             out_dist,
             out_shape_id,
+            out_face_id,
             out_normal,
             out_truncated,
             out_alpha_rejections,

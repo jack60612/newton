@@ -173,6 +173,7 @@ def test_rejected_triangle_does_not_hide_later_triangle_in_same_mesh(test: TestR
     worlds = wp.array([0, 0], dtype=wp.int32, device=device)
     distance = wp.empty(2, dtype=wp.float32, device=device)
     ids = wp.empty(2, dtype=wp.int32, device=device)
+    faces = wp.empty(2, dtype=wp.int32, device=device)
     truncated = wp.empty(2, dtype=wp.int32, device=device)
     newton.intersect_ray(
         model,
@@ -181,10 +182,12 @@ def test_rejected_triangle_does_not_hide_later_triangle_in_same_mesh(test: TestR
         ray_worlds=worlds,
         out_dist=distance,
         out_shape_id=ids,
+        out_face_id=faces,
         out_truncated=truncated,
     )
     np.testing.assert_allclose(distance.numpy(), [3.0, 2.0], atol=1.0e-5)
     np.testing.assert_array_equal(ids.numpy(), [shape, shape])
+    np.testing.assert_array_equal(faces.numpy(), [3, 0])
     np.testing.assert_array_equal(truncated.numpy(), [0, 0])
 
 
@@ -264,8 +267,11 @@ def _layered_mesh(levels):
 
 def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, device: str):
     builder = newton.ModelBuilder()
-    builder.begin_world()
     shape = builder.add_shape_mesh(-1, mesh=_layered_mesh([(0, False), (-0.1, False), (-0.2, True)]))
+    builder.begin_world()
+    # The world pass first finds an opaque face; truncation in the global pass
+    # must invalidate that already-selected face as well as the shape.
+    background = builder.add_shape_mesh(-1, mesh=_quad(-1.0))
     builder.end_world()
     model = builder.finalize(device=device)
     origins = wp.array([[0.1, 0.0, 2.0]], dtype=wp.vec3f, device=device)
@@ -273,6 +279,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
     worlds = wp.array([0], dtype=wp.int32, device=device)
     dist = wp.empty(1, dtype=wp.float32, device=device)
     ids = wp.empty(1, dtype=wp.int32, device=device)
+    faces = wp.full(1, 99, dtype=wp.int32, device=device)
     normal = wp.empty(1, dtype=wp.vec3f, device=device)
     truncated = wp.empty(1, dtype=wp.int32, device=device)
     rejections = wp.full(1, 99, dtype=wp.int32, device=device)
@@ -285,6 +292,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
         ray_worlds=worlds,
         out_dist=dist,
         out_shape_id=ids,
+        out_face_id=faces,
         out_normal=normal,
         out_truncated=truncated,
         out_alpha_rejections=rejections,
@@ -294,6 +302,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
     np.testing.assert_array_equal(rejections.numpy(), [1])
     np.testing.assert_array_equal(dist.numpy(), [-1.0])
     np.testing.assert_array_equal(ids.numpy(), [-1])
+    np.testing.assert_array_equal(faces.numpy(), [-1])
     np.testing.assert_array_equal(normal.numpy(), [[0.0, 0.0, 0.0]])
     newton.intersect_ray(
         model,
@@ -302,6 +311,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
         ray_worlds=worlds,
         out_dist=dist,
         out_shape_id=ids,
+        out_face_id=faces,
         out_normal=normal,
         out_truncated=truncated,
         out_alpha_rejections=rejections,
@@ -310,6 +320,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
     np.testing.assert_array_equal(truncated.numpy(), [0])
     np.testing.assert_array_equal(rejections.numpy(), [2])
     np.testing.assert_array_equal(ids.numpy(), [shape])
+    np.testing.assert_array_equal(faces.numpy(), [4])
     np.testing.assert_allclose(dist.numpy(), [2.2], atol=1.0e-5)
 
     # A zero budget reports truncation at the first transparent candidate
@@ -321,6 +332,7 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
         ray_worlds=worlds,
         out_dist=dist,
         out_shape_id=ids,
+        out_face_id=faces,
         out_normal=normal,
         out_truncated=truncated,
         out_alpha_rejections=rejections,
@@ -330,7 +342,58 @@ def test_alpha_budget_fails_closed_and_reports_each_ray(test: TestRayOpacity, de
     np.testing.assert_array_equal(rejections.numpy(), [0])
     np.testing.assert_array_equal(dist.numpy(), [-1.0])
     np.testing.assert_array_equal(ids.numpy(), [-1])
+    np.testing.assert_array_equal(faces.numpy(), [-1])
     np.testing.assert_array_equal(normal.numpy(), [[0.0, 0.0, 0.0]])
+
+    # With a cutout elsewhere in the model, a normal mesh hit still reports
+    # its own triangle. Replay the same CUDA graph across hit and truncation.
+    front_origins = wp.array([[0.1, 0.0, 2.0]], dtype=wp.vec3f, device=device)
+    front_directions = wp.array([[0, 0, -1]], dtype=wp.vec3f, device=device)
+    back_origins = wp.array([[0.1, 0.0, -2.0]], dtype=wp.vec3f, device=device)
+    back_directions = wp.array([[0, 0, 1]], dtype=wp.vec3f, device=device)
+    wp.copy(origins, back_origins)
+    wp.copy(directions, back_directions)
+
+    def cast_changed():
+        newton.intersect_ray(
+            model,
+            ray_origins=origins,
+            ray_directions=directions,
+            ray_worlds=worlds,
+            out_dist=dist,
+            out_shape_id=ids,
+            out_face_id=faces,
+            out_normal=normal,
+            out_truncated=truncated,
+            out_alpha_rejections=rejections,
+            max_alpha_rejections=1,
+        )
+
+    def check_background():
+        np.testing.assert_allclose(dist.numpy(), [1.0], atol=1.0e-5)
+        np.testing.assert_array_equal(ids.numpy(), [background])
+        np.testing.assert_array_equal(faces.numpy(), [0])
+        np.testing.assert_array_equal(truncated.numpy(), [0])
+        np.testing.assert_array_equal(rejections.numpy(), [0])
+
+    cast_changed()
+    check_background()
+    if wp.get_device(device).is_cuda:
+        with wp.ScopedCapture(device=device) as capture:
+            cast_changed()
+        wp.copy(origins, front_origins)
+        wp.copy(directions, front_directions)
+        faces.fill_(99)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(ids.numpy(), [-1])
+        np.testing.assert_array_equal(faces.numpy(), [-1])
+        np.testing.assert_array_equal(truncated.numpy(), [1])
+        np.testing.assert_array_equal(rejections.numpy(), [1])
+        wp.copy(origins, back_origins)
+        wp.copy(directions, back_directions)
+        faces.fill_(99)
+        wp.capture_launch(capture.graph)
+        check_background()
 
 
 def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, device: str):
@@ -361,6 +424,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
     enabled = wp.array([True] * 6 + [False], dtype=wp.bool, device=device)
     dist = wp.full(7, 99.0, dtype=wp.float32, device=device)
     ids = wp.full(7, 99, dtype=wp.int32, device=device)
+    faces = wp.full(7, 99, dtype=wp.int32, device=device)
     normal = wp.full(7, wp.vec3f(1.0, 1.0, 1.0), dtype=wp.vec3f, device=device)
     truncated = wp.full(7, 99, dtype=wp.int32, device=device)
     rejections = wp.full(7, 99, dtype=wp.int32, device=device)
@@ -374,6 +438,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
             ray_enabled=enabled,
             out_dist=dist,
             out_shape_id=ids,
+            out_face_id=faces,
             out_normal=normal,
             out_truncated=truncated,
             out_alpha_rejections=rejections,
@@ -383,6 +448,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
     def reset():
         dist.fill_(99.0)
         ids.fill_(99)
+        faces.fill_(99)
         normal.fill_(wp.vec3f(1.0, 1.0, 1.0))
         truncated.fill_(99)
         rejections.fill_(99)
@@ -391,6 +457,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
         np.testing.assert_array_equal(rejections.numpy(), [3, 2, 1, 0, 0, 1, 0])
         np.testing.assert_array_equal(truncated.numpy(), [0] * 7)
         np.testing.assert_array_equal(ids.numpy(), [shape, shape, shape, shape, -1, -1, -1])
+        np.testing.assert_array_equal(faces.numpy(), [6, 6, 6, 6, -1, -1, -1])
         np.testing.assert_allclose(dist.numpy(), [2.3, 0.25, 0.15, 0.05, -1, -1, -1], atol=1.0e-5)
         np.testing.assert_array_equal(normal.numpy()[[4, 5, 6]], np.zeros((3, 3), dtype=np.float32))
 
@@ -409,6 +476,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
         np.testing.assert_array_equal(rejections.numpy(), [3, 2, 1, 0, 0, 1, 3])
         np.testing.assert_array_equal(truncated.numpy(), [0] * 7)
         test.assertEqual(int(ids.numpy()[6]), shape)
+        test.assertEqual(int(faces.numpy()[6]), 6)
         np.testing.assert_allclose(dist.numpy()[6], 2.3, atol=1.0e-5)
         wp.copy(enabled, original_enabled)
         reset()
@@ -420,6 +488,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
     ids_without = wp.empty(7, dtype=wp.int32, device=device)
     normal_without = wp.empty(7, dtype=wp.vec3f, device=device)
     truncated_without = wp.empty(7, dtype=wp.int32, device=device)
+    rejections_without = wp.empty(7, dtype=wp.int32, device=device)
 
     def check_omitted(budget):
         newton.intersect_ray(
@@ -432,12 +501,14 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
             out_shape_id=ids_without,
             out_normal=normal_without,
             out_truncated=truncated_without,
+            out_alpha_rejections=rejections_without,
             max_alpha_rejections=budget,
         )
         np.testing.assert_array_equal(dist_without.numpy(), dist.numpy())
         np.testing.assert_array_equal(ids_without.numpy(), ids.numpy())
         np.testing.assert_array_equal(normal_without.numpy(), normal.numpy())
         np.testing.assert_array_equal(truncated_without.numpy(), truncated.numpy())
+        np.testing.assert_array_equal(rejections_without.numpy(), rejections.numpy())
 
     check_omitted(8)
 
@@ -447,6 +518,7 @@ def test_alpha_rejection_counts_per_ray_and_graph_capture(test: TestRayOpacity, 
         np.testing.assert_array_equal(rejections.numpy(), [2, 2, 1, 0, 0, 1, 0])
         np.testing.assert_array_equal(truncated.numpy(), [1, 0, 0, 0, 0, 0, 0])
         np.testing.assert_array_equal(ids.numpy(), [-1, shape, shape, shape, -1, -1, -1])
+        np.testing.assert_array_equal(faces.numpy(), [-1, 6, 6, 6, -1, -1, -1])
         np.testing.assert_allclose(dist.numpy(), [-1, 0.25, 0.15, 0.05, -1, -1, -1], atol=1.0e-5)
         np.testing.assert_array_equal(normal.numpy()[[0, 4, 5, 6]], np.zeros((4, 3), dtype=np.float32))
 
