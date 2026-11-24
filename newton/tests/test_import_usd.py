@@ -8826,6 +8826,26 @@ def Xform "Articulation" (
                     self.assertEqual(solver.mj_model.nv, 12)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_subtree_tendon_survives_deferred_body_import(self):
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        body = UsdGeom.Xform.Define(stage, "/World/envs/env_0/plant/body")
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+        UsdPhysics.MassAPI.Apply(body.GetPrim()).CreateMassAttr(1.0)
+        tendon_path = "/World/envs/env_0/plant/tendon"
+        stage.DefinePrim(tendon_path, "MjcTendon")
+        stage.DefinePrim("/World/envs/env_1/plant/tendon", "MjcTendon")
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage, root_path="/World/envs/env_0/plant")
+        model = builder.finalize(device="cpu")
+        self.assertEqual(model.mujoco.tendon_label, [tendon_path])
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_excluded_joint_articulation_ownership(self):
         from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
