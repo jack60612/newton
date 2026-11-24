@@ -94,6 +94,7 @@ from .kernels import (
     eval_mujoco_coupling_effective_mass_block_kernel,
     eval_mujoco_coupling_effective_mass_kernel,
     eval_mujoco_coupling_gravity_acceleration_kernel,
+    eval_standalone_root_ref_poses,
     frictionloss_force_from_efc_kernel,
     hinge_connect_anchor,
     mass_matrix_diagonal_kernel,
@@ -2459,9 +2460,9 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 raise ValueError(f"MjcActuator {prim.GetPath()} has unsupported number of targets: {len(target_paths)}")
             return str(target_paths[0])
 
-        def get_registered_string_values(attribute_name: str) -> list[str]:
+        def get_registered_string_values(importing_builder: ModelBuilder, attribute_name: str) -> list[str]:
             """Return registered string values for a custom attribute."""
-            attr = builder.custom_attributes.get(attribute_name)
+            attr = importing_builder.custom_attributes.get(attribute_name)
             if attr is None or attr.values is None:
                 return []
             if isinstance(attr.values, dict):
@@ -2472,6 +2473,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
 
         def resolve_actuator_target(
             prim,
+            importing_builder: ModelBuilder,
         ) -> tuple[int, int, str]:
             """Resolve actuator target to (trntype, target_index, target_path).
 
@@ -2480,13 +2482,13 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             prim traversal order.
             """
             target_path = resolve_actuator_target_path(prim)
-            joint_dof_names = get_registered_string_values("mujoco:joint_dof_label")
+            joint_dof_names = get_registered_string_values(importing_builder, "mujoco:joint_dof_label")
             try:
                 return int(SolverMuJoCo.TrnType.JOINT), joint_dof_names.index(target_path), target_path
             except ValueError:
                 pass
 
-            tendon_names = get_registered_string_values("mujoco:tendon_label")
+            tendon_names = get_registered_string_values(importing_builder, "mujoco:tendon_label")
             try:
                 return int(SolverMuJoCo.TrnType.TENDON), tendon_names.index(target_path), target_path
             except ValueError:
@@ -2496,8 +2498,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             # as shapes with the SITE flag in the builder.  We return a sentinel
             # target_index of 0 here; the actual site name will be resolved by
             # the SITE branch in ``_init_actuators`` via ``site_label_to_name``.
-            for i, label in enumerate(builder.shape_label):
-                if label == target_path and (builder.shape_flags[i] & ShapeFlags.SITE):
+            for i, label in enumerate(importing_builder.shape_label):
+                if label == target_path and (importing_builder.shape_flags[i] & ShapeFlags.SITE):
                     return int(SolverMuJoCo.TrnType.SITE), 0, target_path
 
             return -1, -1, target_path
@@ -2573,8 +2575,8 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # using actuator_target_label.
         def resolve_actuator_transmission_type(_: str, context: dict[str, Any]) -> int:
             """Resolve transmission type for a USD actuator prim from its target path."""
-            prim = context["prim"]
-            trntype, _target_idx, _target_path = resolve_actuator_target(prim)
+            # The transformer may have been copied from another builder by add_builder().
+            trntype, _target_idx, _target_path = resolve_actuator_target(context["prim"], context["builder"])
             if trntype < 0:
                 return int(SolverMuJoCo.TrnType.JOINT)
             return trntype
@@ -2583,22 +2585,31 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
             """Resolve target path label for a USD actuator prim."""
             return resolve_actuator_target_path(context["prim"])
 
-        def resolve_actuator_transmission_ids(_: str, context: dict[str, Any]) -> wp.vec2i:
-            """Preserve the optional reference site of a USD site transmission."""
+        def resolve_actuator_transmission_ids(_: str, context: dict[str, Any]) -> wp.vec2i | None:
+            """Resolve the optional reference site of a USD site transmission."""
             prim = context["prim"]
+            authored_attr = prim.GetAttribute("newton:mujoco:actuator_trnid")
+            authored = authored_attr.Get() if authored_attr and authored_attr.HasAuthoredValue() else None
             rel = prim.GetRelationship("mjc:refSite")
             reference_paths = rel.GetTargets() if rel else []
             if not reference_paths:
-                return wp.vec2i(-1, -1)
+                return None if authored is None else wp.vec2i(int(authored[0]), int(authored[1]))
             if len(reference_paths) != 1:
                 raise ValueError(
                     f"MjcActuator {prim.GetPath()} has unsupported number of reference sites: {len(reference_paths)}"
                 )
             reference_path = str(reference_paths[0])
-            for i, label in enumerate(builder.shape_label):
-                if label == reference_path and (builder.shape_flags[i] & ShapeFlags.SITE):
-                    return wp.vec2i(-1, i)
-            raise ValueError(f"MjcActuator {prim.GetPath()} references unknown site '{reference_path}'")
+            # Resolve against the importing builder and this import's prims.
+            importing_builder = context["builder"]
+            shape = context["result"]["path_shape_map"].get(reference_path)
+            if shape is None or not importing_builder.shape_flags[shape] & ShapeFlags.SITE:
+                logger.warning(
+                    "MjcActuator %s references site '%s', which was not imported as a site; ignoring mjc:refSite.",
+                    prim.GetPath(),
+                    reference_path,
+                )
+                return None if authored is None else wp.vec2i(int(authored[0]), int(authored[1]))
+            return wp.vec2i(-1 if authored is None else int(authored[0]), shape)
 
         builder.add_custom_attribute(
             ModelBuilder.CustomAttribute(
@@ -7556,6 +7567,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         # Keep fixed and dynamic roots separate because they use different MuJoCo body creation paths.
         joints_static_roots = np.asarray(joints_static_roots, dtype=np.int32)
         joints_dynamic_roots = np.asarray(joints_dynamic_roots, dtype=np.int32)
+        # Reference FK also needs the roots in every replicated world, not
+        # just the template world selected for MuJoCo conversion.
+        all_articulated = np.flatnonzero(joint_articulation >= 0)
+        owned = {int(body) for body in joint_child[all_articulated]}
+        owned.update(int(body) for body in joint_parent[all_articulated] if body >= 0)
+        equality_joints = set()
+        if eq_constraint_target_kind is not None and eq_constraint_target is not None:
+            equality_joints = {
+                int(target)
+                for kind, target in zip(eq_constraint_target_kind, eq_constraint_target, strict=True)
+                if int(kind) == int(MjcEqualityTargetKind.JOINT) and target >= 0
+            }
+        roots = []
+        for joint in np.flatnonzero(joint_articulation == -1):
+            child = int(joint_child[joint])
+            if joint_parent[joint] == -1 and child not in owned and int(joint) not in equality_joints:
+                owned.add(child)
+                if joint_type[joint] != JointType.FIXED:
+                    roots.append(int(joint))
+        self._standalone_dynamic_roots = wp.array(roots, dtype=wp.int32, device=model.device)
         standalone_root_set = set(joints_static_roots) | set(joints_dynamic_roots)
 
         # Once each standalone body has a world root, its other unassigned joints are loop closures.
@@ -10780,6 +10811,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ref_qd: wp.array | None = None,
         ref_body_q: wp.array | None = None,
         ref_body_qd: wp.array | None = None,
+        standalone_roots: wp.array | None = None,
     ) -> wp.array:
         """Compute body transforms at the reference joint configuration.
 
@@ -10810,6 +10842,26 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         ref_state.body_q = ref_body_q
         ref_state.body_qd = ref_body_qd
         eval_fk(model, ref_q, ref_qd, ref_state)
+        if standalone_roots is not None and len(standalone_roots):
+            wp.launch(
+                eval_standalone_root_ref_poses,
+                dim=len(standalone_roots),
+                inputs=[
+                    standalone_roots,
+                    model.joint_type,
+                    model.joint_child,
+                    model.joint_q_start,
+                    model.joint_qd_start,
+                    model.joint_dof_dim,
+                    model.joint_axis,
+                    model.joint_X_p,
+                    model.joint_X_c,
+                    ref_q,
+                    ref_qd,
+                ],
+                outputs=[ref_body_q],
+                device=model.device,
+            )
         return ref_body_q
 
     def _notify_connect_constraints_changed(
@@ -10840,6 +10892,7 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 self._notify_ref_qd,
                 self._notify_ref_body_q,
                 self._notify_ref_body_qd,
+                self._standalone_dynamic_roots,
             )
             wp.launch(
                 update_connect_constraint_rel_xform_at_qref_kernel,

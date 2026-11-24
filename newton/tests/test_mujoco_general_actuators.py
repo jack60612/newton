@@ -2059,6 +2059,69 @@ def Xform "World"
                 np.testing.assert_array_equal(usd_solver.mj_model.actuator_trnid, native_model.actuator_trnid)
                 np.testing.assert_array_equal(usd_solver.mj_model.actuator_trnid, mjcf_solver.mj_model.actuator_trnid)
 
+        from pxr import Gf, Sdf
+
+        def assert_exports_reference_site(model):
+            for include_sites in (True, False):
+                with self.subTest(include_sites=include_sites):
+                    solver = SolverMuJoCo(model, disable_contacts=True, include_sites=include_sites)
+                    np.testing.assert_array_equal(solver.mj_model.actuator_trntype, native_model.actuator_trntype)
+                    np.testing.assert_array_equal(solver.mj_model.actuator_trnid, native_model.actuator_trnid)
+
+        # Registered transformers may be copied from another builder.
+        robot = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(robot)
+        robot.add_body(mass=1.0, inertia=wp.mat33(np.eye(3)), label="robot_body")
+        scene = ModelBuilder()
+        scene.add_builder(robot)
+        result = scene.add_usd(stage)
+        model = scene.finalize()
+        reference_shape = result["path_shape_map"]["/World/base/reference_site"]
+        self.assertEqual(model.mujoco.actuator_trntype.numpy()[0], int(SolverMuJoCo.TrnType.SITE))
+        self.assertEqual(model.mujoco.actuator_trnid.numpy()[0, 1], reference_shape)
+        assert_exports_reference_site(model)
+
+        # Reimporting the same prim paths must reference each import's sites.
+        builder = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        first = builder.add_usd(stage)
+        second = builder.add_usd(stage)
+        model = builder.finalize()
+        first_reference = first["path_shape_map"]["/World/base/reference_site"]
+        second_reference = second["path_shape_map"]["/World/base/reference_site"]
+        self.assertNotEqual(first_reference, second_reference)
+        np.testing.assert_array_equal(model.mujoco.actuator_trnid.numpy()[:, 1], [first_reference, second_reference])
+
+        builder = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        with self.assertLogs("newton", level="WARNING") as logs:
+            builder.add_usd(stage, load_sites=False)
+        self.assertIn("ignoring mjc:refSite", "\n".join(logs.output))
+        self.assertEqual(builder.finalize().mujoco.actuator_trnid.numpy()[0, 1], -1)
+
+        # The relationship takes precedence over an authored namespaced reference.
+        actuator = stage.GetPrimAtPath("/World/relative_site_motor")
+        trnid_attr = actuator.CreateAttribute("newton:mujoco:actuator_trnid", Sdf.ValueTypeNames.Int2)
+        builder = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        result = builder.add_usd(stage)
+        reference_shape = result["path_shape_map"]["/World/base/reference_site"]
+        target_shape = result["path_shape_map"]["/World/base/target_site"]
+        trnid_attr.Set(Gf.Vec2i(-1, target_shape))
+        builder = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage)
+        self.assertEqual(builder.finalize().mujoco.actuator_trnid.numpy()[0, 1], reference_shape)
+
+        actuator.GetRelationship("mjc:refSite").ClearTargets(True)
+        trnid_attr.Set(Gf.Vec2i(-1, reference_shape))
+        builder = ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage)
+        model = builder.finalize()
+        self.assertEqual(model.mujoco.actuator_trnid.numpy()[0, 1], reference_shape)
+        assert_exports_reference_site(model)
+
     def test_site_actuator_with_include_sites_false(self):
         """Site actuator is resolved even when include_sites=False."""
         builder = ModelBuilder()

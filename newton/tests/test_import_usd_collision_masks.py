@@ -105,13 +105,15 @@ class TestUsdCollisionMasks(unittest.TestCase):
         """Keep repeated USD imports independent when compiling collision masks."""
         builder = self._builder()
         stage = self._stage([[(0, 1)], [(1, 0)], [(1, 0)]])
-        builder.add_usd(stage, load_visual_shapes=False)
-        builder.add_usd(stage, load_visual_shapes=False)
+        imports = [builder.add_usd(stage, load_visual_shapes=False)["path_shape_map"] for _ in range(2)]
         model = builder.finalize(device="cpu")
         domains = model.mujoco.collision_mask_domain.numpy()
         self.assertEqual(len(np.unique(domains)), 2)
+        shapes = [[mapping[f"/body{i}/shape0"] for i in range(3)] for mapping in imports]
+        expected = {tuple(sorted((s[0], s[i]))) for s in shapes for i in (1, 2)}
+        expected |= {tuple(sorted((a, b))) for a in shapes[0] for b in shapes[1]}
+        self.assertEqual(set(map(tuple, model.shape_contact_pairs.numpy())), expected)
         solver = self._solver(model)
-        expected = set(map(tuple, model.shape_contact_pairs.numpy()))
         for a in range(model.shape_count):
             for b in range(a + 1, model.shape_count):
                 self.assertEqual(self._masks_allow(solver, a, b), (a, b) in expected)
@@ -244,6 +246,61 @@ class TestUsdCollisionMasks(unittest.TestCase):
         wire_body = int(solver.mj_model.geom_bodyid[shape_to_geom[wire]])
         self.assertGreater(wire_body, 0)
         self.assertEqual(int(solver.mj_model.body_weldid[wire_body]), 0)
+
+    def test_masks_keep_groups_and_support_materialized_filters(self):
+        for native_first in (True, False):
+            with self.subTest(native_first=native_first):
+                builder = self._builder()
+                cfg = newton.ModelBuilder.ShapeConfig(collision_group=2)
+                if native_first:
+                    builder.add_shape_sphere(builder.add_body(), radius=0.1, cfg=cfg)
+                _ = builder.shape_collision_filter_pairs
+                result = builder.add_usd(self._stage([[(1, 0)], [(1, 0)]]), load_visual_shapes=False)
+                if not native_first:
+                    builder.add_shape_sphere(builder.add_body(), radius=0.1, cfg=cfg)
+                model = builder.finalize(device="cpu")
+                imported = [result["path_shape_map"][f"/body{i}/shape0"] for i in range(2)]
+                self.assertEqual(model.shape_collision_group.numpy()[imported].tolist(), [1, 1])
+                self.assertEqual(len(model.shape_contact_pairs.numpy()), 0)
+
+    def test_masks_do_not_widen_nonpositive_groups(self):
+        for group in (0, -1):
+            with self.subTest(group=group):
+                builder = self._builder()
+                builder.default_shape_cfg.collision_group = group
+                result = builder.add_usd(self._stage([[(1, 1)], [(1, 1)]]), load_visual_shapes=False)
+                model = builder.finalize(device="cpu")
+                shapes = [result["path_shape_map"][f"/body{i}/shape0"] for i in range(2)]
+                self.assertEqual(len(model.shape_contact_pairs.numpy()), 0)
+                self.assertFalse(self._masks_allow(self._solver(model), *shapes))
+
+    def test_zero_masks_disable_collisions(self):
+        builder = self._builder()
+        for group in (1, 2):
+            cfg = newton.ModelBuilder.ShapeConfig(collision_group=group)
+            builder.add_shape_sphere(builder.add_body(), radius=0.1, cfg=cfg)
+        builder.default_shape_cfg.collision_group = 2
+        result = builder.add_usd(self._stage([[(0, 0)]]), load_visual_shapes=False)
+        model = builder.finalize(device="cpu")
+        shape = result["path_shape_map"]["/body0/shape0"]
+        self.assertEqual(int(model.shape_collision_group.numpy()[shape]), 0)
+        self.assertEqual(len(model.shape_contact_pairs.numpy()), 0)
+
+    def test_rejected_masks_on_same_body_do_not_emit_filters(self):
+        builder = self._builder()
+        builder.add_usd(self._stage([[(1, 0)] * 100]), load_visual_shapes=False)
+        self.assertEqual(len(builder.shape_collision_filter_pairs), 0)
+
+    def test_large_multi_domain_filters_do_not_widen(self):
+        builder = self._builder()
+        stage = self._stage([[(1, 1), (2, 2)] for _ in range(33)])
+        for i in range(33):
+            UsdGeom.Xformable(stage.GetPrimAtPath(f"/body{i}")).AddTranslateOp().Set((float(i), 0.0, 0.0))
+        for _ in range(4):
+            builder.add_usd(stage, load_visual_shapes=False)
+        model = builder.finalize(device="cpu")
+        with self.assertRaisesRegex(ValueError, "represent Newton collision filters exactly"):
+            self._solver(model)
 
     def test_unauthored_masks_have_no_domain(self):
         """Leave unauthored shapes outside preserved collision mask domains."""

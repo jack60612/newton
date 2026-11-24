@@ -33,10 +33,7 @@ from ..geometry import Mesh, ShapeFlags, compute_inertia_sphere
 from ..sim.builder import ModelBuilder
 from ..sim.enums import JointTargetMode, JointType
 from ..sim.model import Model
-from ..solvers.mujoco.collision_masks import (
-    MUJOCO_COLLISION_MASK_DOMAIN_UNSET,
-    compile_collision_masks,
-)
+from ..solvers.mujoco.collision_masks import MUJOCO_COLLISION_MASK_DOMAIN_UNSET
 from ..solvers.mujoco.enums import EqType, _ActuatorBiasType, _ActuatorDynamicsType, _ActuatorGainType
 from ..solvers.mujoco.equality import _add_equality_constraint, _register_equality_constraint_attributes
 from ..solvers.mujoco.utils import (
@@ -135,6 +132,71 @@ class _CableAttachmentCandidate:
     point_count: int
     closed: bool
     target_path: str
+
+
+def _restrict_to_collision_masks(builder: ModelBuilder, domain_attr: ModelBuilder.CustomAttribute, domain: int) -> None:
+    """Intersect one import's masks with builder-assigned collision groups."""
+    domain_shapes = [shape for shape, shape_domain in domain_attr.values.items() if shape_domain == domain]
+    contype = builder.custom_attributes["mujoco:contype"].values
+    conaffinity = builder.custom_attributes["mujoco:conaffinity"].values
+    classes: dict[tuple[int, int, int], list[int]] = {}
+    for shape in domain_shapes:
+        if not builder.shape_flags[shape] & ShapeFlags.COLLIDE_SHAPES:
+            continue
+        group = int(builder.shape_collision_group[shape])
+        if group == 0:
+            del domain_attr.values[shape]
+            continue
+        collision_type = int(contype[shape]) & 0xFFFFFFFF
+        collision_affinity = int(conaffinity[shape]) & 0xFFFFFFFF
+        if collision_type == 0 and collision_affinity == 0:
+            builder.shape_collision_group[shape] = 0
+            continue
+        classes.setdefault((collision_type, collision_affinity, group), []).append(shape)
+    if not classes:
+        return
+
+    keys = list(classes)
+    class_type = np.asarray([key[0] for key in keys], dtype=np.uint32)
+    class_affinity = np.asarray([key[1] for key in keys], dtype=np.uint32)
+    class_group = np.asarray([key[2] for key in keys], dtype=np.int64)
+    class_members_by_body = []
+    for key in keys:
+        by_body: dict[int, list[int]] = {}
+        for shape in classes[key]:
+            by_body.setdefault(builder.shape_body[shape], []).append(shape)
+        class_members_by_body.append(by_body)
+    masked = {shape for members in classes.values() for shape in members}
+    prefiltered = {
+        (min(shape_a, shape_b), max(shape_a, shape_b))
+        for shape_a, shape_b in builder._materialized_filter_template()
+        if shape_a in masked and shape_b in masked
+    }
+    masks_widen_groups = False
+    for i in range(len(keys)):
+        masks_allow = ((class_type[i] & class_affinity[i:]) != 0) | ((class_type[i:] & class_affinity[i]) != 0)
+        group, other_groups = class_group[i], class_group[i:]
+        groups_allow = ((group > 0) & ((other_groups == group) | (other_groups < 0))) | (
+            (group < 0) & (other_groups != group)
+        )
+        for offset in np.flatnonzero(groups_allow & ~masks_allow):
+            by_body_a, by_body_b = class_members_by_body[i], class_members_by_body[i + offset]
+            for body_a, members_a in by_body_a.items():
+                for body_b, members_b in by_body_b.items():
+                    if body_a == body_b or (offset == 0 and body_a > body_b):
+                        continue
+                    for shape_a, shape_b in itertools.product(members_a, members_b):
+                        pair = (min(shape_a, shape_b), max(shape_a, shape_b))
+                        if pair not in prefiltered:
+                            builder.add_shape_collision_filter_pair(*pair)
+        if not masks_widen_groups:
+            for offset in np.flatnonzero(~groups_allow & masks_allow):
+                if len(class_members_by_body[i].keys() | class_members_by_body[i + offset].keys()) > 1:
+                    masks_widen_groups = True
+                    break
+    if masks_widen_groups:
+        for shape in domain_shapes:
+            domain_attr.values.pop(shape, None)
 
 
 def parse_usd(
@@ -566,10 +628,23 @@ def parse_usd(
     # MuJoCo angle units (``mjc:compiler:angle``) are a scene-level compiler setting of the stage.
     # A subtree import (``root_path``, e.g. one clone source of a larger scene) contains no
     # PhysicsScene of its own, and a referenced asset's own scene lies outside its default prim,
-    # so resolve units from the stage's first active PhysicsScene instead of the schema default.
+    # so joints resolve units from the stage's first PhysicsScene instead of the schema default.
+    # Only the units come from that scene; the lookup runs once, when the first joint is parsed.
     units_scene_prim = physics_scene_prim
-    if units_scene_prim is None and root_path != "/":
-        units_scene_prim = next((prim for prim in stage.Traverse() if prim.IsA(UsdPhysics.Scene)), None)
+    units_scene_pending = physics_scene_prim is None and root_path != "/"
+
+    def _units_scene_prim() -> Usd.Prim | None:
+        nonlocal units_scene_prim, units_scene_pending
+        if units_scene_pending and (mjc_resolver is not None or builder_custom_attr_joint):
+            units_scene_pending = False
+            prim_iter = iter(Usd.PrimRange.Stage(stage, Usd.TraverseInstanceProxies(Usd.PrimDefaultPredicate)))
+            for prim in prim_iter:
+                if any(re.match(pattern, str(prim.GetPath())) for pattern in ignore_paths):
+                    prim_iter.PruneChildren()
+                elif prim.IsA(UsdPhysics.Scene):
+                    units_scene_prim = prim
+                    break
+        return units_scene_prim
 
     legacy_rigid_object_types = (
         UsdPhysics.ObjectType.RigidBody,
@@ -771,13 +846,17 @@ def parse_usd(
             return (body_idx, wp.vec3())
 
         body_prim = stage.GetPrimAtPath(body_path)
-        # Keep the world-to-local subtraction in USD's double precision. Casting
-        # both world poses to Warp first loses small authored site offsets, even
-        # for a pure translation. The rigid body frame excludes scale, while the
-        # target's full world position retains scale and reset-xform semantics.
-        body_world = xform_cache.GetLocalToWorldTransform(body_prim).RemoveScaleShear()
-        target_world = xform_cache.GetLocalToWorldTransform(target_prim)
-        local_pos = body_world.GetInverse().Transform(target_world.ExtractTranslation())
+        # Express the anchor in the rigid frame the importer gives the body
+        # (usd.get_transform's rotation, also correct under ancestor shear or tiny
+        # scales), but subtract the world positions in USD's double precision:
+        # casting both world poses to Warp first loses small authored site
+        # offsets, even for a pure translation. The target's world position keeps
+        # scale and reset-xform semantics.
+        body_rot = usd.get_transform(body_prim, local=False, xform_cache=xform_cache).q
+        body_quat = Gf.Quatd(float(body_rot[3]), float(body_rot[0]), float(body_rot[1]), float(body_rot[2]))
+        body_pos = xform_cache.GetLocalToWorldTransform(body_prim).ExtractTranslation()
+        target_pos = xform_cache.GetLocalToWorldTransform(target_prim).ExtractTranslation()
+        local_pos = body_quat.GetNormalized().GetInverse().Transform(target_pos - body_pos)
         return (body_idx, wp.vec3(*local_pos))
 
     def _get_first_target(prim: Usd.Prim, rel_name: str) -> str:
@@ -864,6 +943,7 @@ def parse_usd(
         return tetmesh_cache[prim_path]
 
     bodies_with_visual_shapes: set[int] = set()
+    body_site_frame_cache = {}
 
     def _get_prim_world_mat(prim, articulation_root_xform, incoming_world_xform):
         prim_world_mat = usd.get_transform_matrix(prim, local=False, xform_cache=xform_cache)
@@ -954,30 +1034,41 @@ def parse_usd(
                 )
             return
 
-        if is_site and body_xform is not None:
-            # Subtract world poses in USD double precision before the final
-            # Warp cast. Incoming/rebase rigid transforms cancel in body-local
-            # coordinates.
-            body_path = _get_rigid_body_ancestor_path(prim)
-            assert body_path is not None
-            body_prim = stage.GetPrimAtPath(body_path)
-            body_world = xform_cache.GetLocalToWorldTransform(body_prim).RemoveScaleShear()
-            site_world = xform_cache.GetLocalToWorldTransform(prim)
-            rel_mat = wp.mat44(np.asarray(site_world * body_world.GetInverse()).T)
+        prim_world_mat = _get_prim_world_mat(
+            prim,
+            articulation_root_xform,
+            incoming_world_xform if (parent_body_id == -1 or body_xform is not None) else None,
+        )
+        if body_xform is not None:
+            # Use the body transform used by the builder to avoid USD/physics pose mismatches.
+            body_world_mat = _xform_to_mat44(body_xform)
+            rel_mat = wp.inverse(body_world_mat) @ prim_world_mat
         else:
-            prim_world_mat = _get_prim_world_mat(
-                prim,
-                articulation_root_xform,
-                incoming_world_xform if (parent_body_id == -1 or body_xform is not None) else None,
-            )
-            if body_xform is not None:
-                # Visuals follow the body transform actually used by the builder.
-                body_world_mat = _xform_to_mat44(body_xform)
-                rel_mat = wp.inverse(body_world_mat) @ prim_world_mat
-            else:
-                rel_mat = prim_world_mat
+            rel_mat = prim_world_mat
 
         xform_pos, xform_rot, scale = wp.transform_decompose(rel_mat)
+        if is_site and body_xform is not None:
+            # Subtracting the float32 world positions above loses small site offsets
+            # far from the origin. Redo the subtraction in USD double precision and
+            # rotate it into the builder's body frame, with the incoming/rebase
+            # rotation applied to body_xform undone so both are in USD world axes.
+            cached_frame = body_site_frame_cache.get(parent_body_id)
+            if cached_frame is None:
+                body_rot = body_xform.q
+                if incoming_world_xform is not None:
+                    body_rot = wp.quat_inverse(incoming_world_xform.q) * body_rot
+                if articulation_root_xform is not None:
+                    body_rot = articulation_root_xform.q * body_rot
+                body_quat = Gf.Quatd(float(body_rot[3]), float(body_rot[0]), float(body_rot[1]), float(body_rot[2]))
+                body_prim = stage.GetPrimAtPath(_get_rigid_body_ancestor_path(prim))
+                cached_frame = (
+                    body_quat.GetNormalized().GetInverse(),
+                    xform_cache.GetLocalToWorldTransform(body_prim).ExtractTranslation(),
+                )
+                body_site_frame_cache[parent_body_id] = cached_frame
+            body_quat_inv, body_world_pos = cached_frame
+            offset = xform_cache.GetLocalToWorldTransform(prim).ExtractTranslation() - body_world_pos
+            xform_pos = wp.vec3(*body_quat_inv.Transform(offset))
         xform = wp.transform(xform_pos, xform_rot)
 
         shape_id = -1
@@ -1267,7 +1358,7 @@ def parse_usd(
             path_body_map=path_body_map,
             path_joint_map=path_joint_map,
             builder_custom_attr_joint=builder_custom_attr_joint,
-            physics_scene_prim=units_scene_prim,
+            physics_scene_prim=_units_scene_prim(),
             usd_axis_to_axis=usd_axis_to_axis,
             DegreesToRadian=DegreesToRadian,
             default_joint_armature=default_joint_armature,
@@ -1304,7 +1395,7 @@ def parse_usd(
             path_joint_map=path_joint_map,
             merged_dof_offset=merged_dof_offset,
             builder_custom_attr_joint=builder_custom_attr_joint,
-            physics_scene_prim=units_scene_prim,
+            physics_scene_prim=_units_scene_prim(),
             usd_axis_to_axis=usd_axis_to_axis,
             default_joint_velocity_limit=default_joint_velocity_limit,
             joint_drive_gains_scaling=joint_drive_gains_scaling,
@@ -1862,14 +1953,34 @@ def parse_usd(
         for joint_path, joint_desc in joint_descriptions.items()
     )
 
+    articulation_roots = (
+        set(ret_dict[UsdPhysics.ObjectType.Articulation][0]) if override_root_xform and not no_articulations else set()
+    )
+
     # insert remaining bodies that were not part of any articulation so far
     # (root joints for these bodies will be added after mass properties are resolved)
     for path, rigid_body_desc in body_specs.items():
         key = str(path)
+        # A deferred body under an articulation root must use the same root
+        # rebasing as the bodies imported with that articulation.
+        root_path = Sdf.Path(path).GetParentPath()
+        while root_path != Sdf.Path.emptyPath and root_path not in articulation_roots:
+            root_path = root_path.GetParentPath()
+        root_xform = (
+            usd.get_transform(stage.GetPrimAtPath(root_path), local=False, xform_cache=xform_cache)
+            if root_path in articulation_roots
+            else None
+        )
+        origin = None
+        if root_xform is not None:
+            body_world = usd.get_transform(stage.GetPrimAtPath(path), local=False, xform_cache=xform_cache)
+            origin = incoming_world_xform * wp.transform_inverse(root_xform) * body_world
         body_id: int = parse_body(  # pyright: ignore[reportAssignmentType]
             rigid_body_desc,
             stage.GetPrimAtPath(path),
             incoming_xform=incoming_world_xform,
+            articulation_root_xform=root_xform,
+            origin=origin,
             add_body_to_builder=True,
         )
 
@@ -2462,60 +2573,9 @@ def parse_usd(
         body_owner=_deformable_prims.body_owner,
     )
 
-    # Lower masks after USD group and explicit filters so neither can be widened.
-    # Solver mask regeneration then retains the restrictions across imports.
+    # Intersect authored masks with the USD and builder collision restrictions.
     if collision_mask_domain_attr is not None:
-        masked_shapes = np.asarray(
-            [
-                shape
-                for shape, domain in collision_mask_domain_attr.values.items()
-                if domain == collision_mask_domain and builder.shape_flags[shape] & ShapeFlags.COLLIDE_SHAPES
-            ],
-            dtype=np.int32,
-        )
-        if masked_shapes.size:
-            to_local = {int(shape): local for local, shape in enumerate(masked_shapes)}
-            prefiltered_pairs = [
-                (to_local[shape_a], to_local[shape_b])
-                for shape_a, shape_b in builder._shape_collision_filter_pairs.explicit_pairs
-                if shape_a in to_local and shape_b in to_local
-            ]
-            contype_attr = builder.custom_attributes["mujoco:contype"]
-            conaffinity_attr = builder.custom_attributes["mujoco:conaffinity"]
-            compiled = compile_collision_masks(
-                [int(contype_attr.values[int(shape)]) for shape in masked_shapes],
-                [int(conaffinity_attr.values[int(shape)]) for shape in masked_shapes],
-                prefiltered_pairs=prefiltered_pairs,
-                force_nonzero=True,
-                max_positive_groups=1,
-            )
-            default_positive_group = int(builder.default_shape_cfg.collision_group)
-            if default_positive_group <= 0:
-                default_positive_group = 1
-            used_negative_ids = {-int(group) for group in builder.shape_collision_group if int(group) < 0}
-            negative_group_map = {}
-            next_negative_id = 1
-            for raw_group in np.unique(compiled.groups):
-                group = int(raw_group)
-                if group >= 0:
-                    continue
-                while next_negative_id in used_negative_ids:
-                    next_negative_id += 1
-                negative_group_map[group] = -next_negative_id
-                used_negative_ids.add(next_negative_id)
-                next_negative_id += 1
-            for local_shape, shape in enumerate(masked_shapes):
-                group = int(compiled.groups[local_shape])
-                if group > 0:
-                    group = default_positive_group
-                elif group < 0:
-                    group = negative_group_map[group]
-                builder.shape_collision_group[int(shape)] = group
-            for shape_a, shape_b in compiled.excluded_pairs:
-                builder.add_shape_collision_filter_pair(
-                    int(masked_shapes[shape_a]),
-                    int(masked_shapes[shape_b]),
-                )
+        _restrict_to_collision_masks(builder, collision_mask_domain_attr, collision_mask_domain)
 
     def _resolve_newton_mimic(joint_prim: Usd.Prim) -> tuple[Sdf.Path | None, float, float]:
         """Resolve the mimic leader joint and coefficients from a follower joint prim.

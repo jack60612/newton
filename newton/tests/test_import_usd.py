@@ -8762,6 +8762,10 @@ def Xform "Articulation" (
         self.assertFalse(bool(model.constraint_mimic_enabled.numpy()[0]))
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    @unittest.skipUnless(
+        importlib.util.find_spec("mujoco") and importlib.util.find_spec("mujoco_warp"),
+        "Requires mujoco and mujoco_warp",
+    )
     def test_mjc_equality_connect_between_articulations(self):
         """Preserve body ownership when CONNECT endpoints span articulations."""
         import mujoco
@@ -8820,6 +8824,109 @@ def Xform "Articulation" (
                     # The solver also adds inactive welds for dynamic roots.
                     self.assertEqual(np.count_nonzero(solver.mj_model.eq_type == mujoco.mjtEq.mjEQ_CONNECT), 1)
                     self.assertEqual(solver.mj_model.nv, 12)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_excluded_joint_articulation_ownership(self):
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        # Two trees connected only by an excluded joint must retain their own bodies.
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        for name in ("First", "Second"):
+            root = UsdGeom.Xform.Define(stage, f"/World/{name}")
+            UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+            UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+            UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(1.0)
+            frame = UsdGeom.Xform.Define(stage, f"/World/{name}/Frame")
+            UsdPhysics.RigidBodyAPI.Apply(frame.GetPrim())
+            UsdPhysics.MassAPI.Apply(frame.GetPrim()).CreateMassAttr(1.0)
+            joint = UsdPhysics.FixedJoint.Define(stage, f"/World/{name}/Joint")
+            joint.CreateBody0Rel().SetTargets([root.GetPath()])
+            joint.CreateBody1Rel().SetTargets([frame.GetPath()])
+        joint = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+        joint.CreateBody0Rel().SetTargets(["/World/First"])
+        joint.CreateBody1Rel().SetTargets(["/World/Second"])
+        joint.CreateExcludeFromArticulationAttr(True)
+        for ordered in (False, True):
+            with self.subTest(ordered=ordered):
+                builder = newton.ModelBuilder()
+                result = builder.add_usd(stage, bodies_follow_joint_ordering=ordered)
+                self.assertEqual(builder.body_count, 4)
+                self.assertEqual(len(set(result["path_body_map"].values())), 4)
+
+        # An excluded-only nested descendant is standalone, including when
+        # overriding the authored root transform.
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        root = UsdGeom.Xform.Define(stage, "/World/Root")
+        root.AddTranslateOp().Set(Gf.Vec3d(100, 0, 0))
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+        UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+        UsdPhysics.MassAPI.Apply(root.GetPrim()).CreateMassAttr(1.0)
+        frame = UsdGeom.Xform.Define(stage, "/World/Root/Frame")
+        UsdPhysics.RigidBodyAPI.Apply(frame.GetPrim())
+        UsdPhysics.MassAPI.Apply(frame.GetPrim()).CreateMassAttr(1.0)
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/Root/Fixed")
+        fixed.CreateBody0Rel().SetTargets([root.GetPath()])
+        fixed.CreateBody1Rel().SetTargets([frame.GetPath()])
+        child = UsdGeom.Xform.Define(stage, "/World/Root/Child")
+        child.AddTranslateOp().Set(Gf.Vec3d(1, 0, 0))
+        UsdPhysics.RigidBodyAPI.Apply(child.GetPrim())
+        UsdPhysics.MassAPI.Apply(child.GetPrim()).CreateMassAttr(1.0)
+        joint = UsdPhysics.SphericalJoint.Define(stage, "/World/Root/Connect")
+        joint.CreateBody0Rel().SetTargets([frame.GetPath()])
+        joint.CreateBody1Rel().SetTargets([child.GetPath()])
+        joint.CreateExcludeFromArticulationAttr(True)
+        joint.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"]))
+        for ordered in (False, True):
+            with self.subTest(nested=True, ordered=ordered):
+                builder = newton.ModelBuilder()
+                SolverMuJoCo.register_custom_attributes(builder)
+                result = builder.add_usd(
+                    stage,
+                    xform=wp.transform((5, 0, 0), wp.quat_identity()),
+                    override_root_xform=True,
+                    bodies_follow_joint_ordering=ordered,
+                    convert_mjc_equality_constraints=False,
+                    schema_resolvers=[usd.SchemaResolverMjc()],
+                )
+                self.assertEqual(builder.body_count, 3)
+                for path, x in (("/World/Root", 5), ("/World/Root/Child", 6)):
+                    np.testing.assert_allclose(builder.body_q[result["path_body_map"][path]].p, (x, 0, 0))
+                model = builder.finalize(device="cpu")
+                self.assertEqual(model.mujoco.equality_constraint_count, 1)
+                self.assertEqual(
+                    model.mujoco.equality_constraint_body1.numpy()[0], result["path_body_map"]["/World/Root/Frame"]
+                )
+                self.assertEqual(
+                    model.mujoco.equality_constraint_body2.numpy()[0], result["path_body_map"]["/World/Root/Child"]
+                )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_excluded_joint_single_body_articulations(self):
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+        for path in ("/World/A", "/World/B"):
+            prim = UsdGeom.Xform.Define(stage, path).GetPrim()
+            UsdPhysics.RigidBodyAPI.Apply(prim)
+            UsdPhysics.ArticulationRootAPI.Apply(prim)
+            UsdPhysics.MassAPI.Apply(prim).CreateMassAttr(1.0)
+        joint = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+        joint.CreateBody0Rel().SetTargets(["/World/A"])
+        joint.CreateBody1Rel().SetTargets(["/World/B"])
+        joint.CreateExcludeFromArticulationAttr(True)
+        for ordered in (False, True):
+            with self.subTest(ordered=ordered):
+                builder = newton.ModelBuilder()
+                result = builder.add_usd(stage, bodies_follow_joint_ordering=ordered)
+                self.assertEqual(builder.body_count, 2)
+                self.assertEqual(builder.articulation_count, 2)
+                self.assertNotEqual(result["path_body_map"]["/World/A"], result["path_body_map"]["/World/B"])
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_equality_connect_static_reference_anchors(self):
@@ -9312,6 +9419,67 @@ def Xform "Articulation" (
                             model.mujoco.equality_constraint_anchor.numpy()[0],
                             np.asarray(expected, dtype=np.float32),
                         )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mjc_equality_site_anchor_matches_imported_body_frame(self):
+        """Anchors use the imported body frame under ancestor shear and tiny body scales."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
+
+        for case in ("sheared", "tiny_scale"):
+            with self.subTest(case=case):
+                stage = Usd.Stage.CreateInMemory()
+                UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+                UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+                root = UsdGeom.Xform.Define(stage, "/World")
+                stage.SetDefaultPrim(root.GetPrim())
+                body = UsdGeom.Xform.Define(stage, "/World/Body")
+                body.AddTranslateOp().Set(Gf.Vec3d(0.5, -1.5, 2.0))
+                UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+                mass = UsdPhysics.MassAPI.Apply(body.GetPrim())
+                mass.CreateMassAttr(1.0)
+                mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+                if case == "sheared":
+                    # A rotated articulated body beneath a non-uniform ancestor scale has a
+                    # sheared world matrix; the importer places it with usd.get_transform().
+                    root.AddScaleOp().Set(Gf.Vec3d(2.0, 3.0, 4.0))
+                    body.AddRotateZOp().Set(45.0)
+                    UsdPhysics.ArticulationRootAPI.Apply(body.GetPrim())
+                    child = UsdGeom.Xform.Define(stage, "/World/Body/Child")
+                    child.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.5))
+                    UsdPhysics.RigidBodyAPI.Apply(child.GetPrim())
+                    child_mass = UsdPhysics.MassAPI.Apply(child.GetPrim())
+                    child_mass.CreateMassAttr(1.0)
+                    child_mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.1))
+                    hinge = UsdPhysics.RevoluteJoint.Define(stage, "/World/Hinge")
+                    hinge.CreateBody0Rel().SetTargets([body.GetPath()])
+                    hinge.CreateBody1Rel().SetTargets([child.GetPath()])
+                    hinge.CreateLocalPos0Attr(Gf.Vec3f(0.0, 0.0, 0.5))
+                    hinge.CreateAxisAttr("Z")
+                    site_offset = Gf.Vec3d(0.1, 0.2, 0.3)
+                else:
+                    body.AddRotateZOp().Set(30.0)
+                    body.AddScaleOp().Set(Gf.Vec3d(1.0e-4))
+                    site_offset = Gf.Vec3d(100.0, 200.0, -300.0)
+                site = UsdGeom.Xform.Define(stage, "/World/Body/Site")
+                site.AddTranslateOp().Set(site_offset)
+                site.GetPrim().SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcSiteAPI"]))
+                connect = UsdPhysics.SphericalJoint.Define(stage, "/World/Connect")
+                connect.CreateBody0Rel().SetTargets([site.GetPath()])
+                connect.CreateExcludeFromArticulationAttr(True)
+                connect.GetPrim().SetMetadata(
+                    "apiSchemas", Sdf.TokenListOp.Create(prependedItems=["MjcEqualityConnectAPI"])
+                )
+
+                builder = newton.ModelBuilder()
+                SolverMuJoCo.register_custom_attributes(builder)
+                result = builder.add_usd(stage, convert_mjc_equality_constraints=False)
+                model = builder.finalize(device="cpu")
+                body_q = model.body_q.numpy()[result["path_body_map"]["/World/Body"]]
+                anchor = model.mujoco.equality_constraint_anchor.numpy()[0]
+                body_tf = wp.transform(wp.vec3(*body_q[:3]), wp.quat(*body_q[3:]))
+                world_anchor = wp.transform_point(body_tf, wp.vec3(*anchor))
+                site_world = UsdGeom.XformCache().GetLocalToWorldTransform(site.GetPrim()).ExtractTranslation()
+                np.testing.assert_allclose(world_anchor, site_world, atol=1.0e-6, rtol=0.0)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_mjc_equality_connect_site_parsing(self):

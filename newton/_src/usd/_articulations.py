@@ -110,19 +110,22 @@ def _parse_articulations(
         if verbose and articulation_custom_attrs:
             logger.info("Extracted articulation custom attributes: %s", articulation_custom_attrs)
         body_data = {}
-        # OpenUSD includes external equality endpoints in articulatedBodies.
-        # Do not consume another articulation's body specs for equality-only
-        # connections; non-equality joints still define structural ownership.
-        equality_body_paths = set()
-        structural_body_paths = set()
+        # OpenUSD also lists the far endpoint of excluded joints in articulatedBodies;
+        # only bodies reached through a tree joint belong to this articulation.
+        tree_body_paths = set()
         for joint_path in desc.articulatedJoints:
             joint_key = str(joint_path)
             joint_desc = joint_descriptions[joint_key]
-            body_paths = (
-                equality_body_paths if joint_key in mjc_equality_connect_or_weld_paths else structural_body_paths
-            )
-            body_paths.update((str(joint_desc.body0), str(joint_desc.body1)))
-        equality_only_body_paths = equality_body_paths - structural_body_paths
+            if joint_key in mjc_equality_connect_or_weld_paths or joint_desc.excludeFromArticulation:
+                continue
+            tree_body_paths.update((str(joint_desc.body0), str(joint_desc.body1)))
+        # A root body can be omitted from articulatedBodies when its only joint
+        # is excluded. Never claim the far endpoint as a substitute.
+        if not tree_body_paths:
+            if articulation_path in body_specs:
+                tree_body_paths.add(articulation_path)
+            else:
+                tree_body_paths.update(str(p) for p in desc.articulatedBodies)
         body_ids = {}
         body_labels = []
         current_body_id = 0
@@ -133,6 +136,9 @@ def _parse_articulations(
         # Complete structural endpoints without claiming equality/loop endpoints.
         articulated_body_paths = list(desc.articulatedBodies)
         articulated_body_keys = {str(p) for p in articulated_body_paths}
+        if articulation_path in tree_body_paths and articulation_path not in articulated_body_keys:
+            articulated_body_paths.append(path)
+            articulated_body_keys.add(articulation_path)
         for joint_path in desc.articulatedJoints:
             if str(joint_path) in mjc_equality_connect_or_weld_paths:
                 continue
@@ -150,11 +156,7 @@ def _parse_articulations(
             key = str(p)
             if key in ignored_body_paths:
                 continue
-            if (
-                key in equality_only_body_paths
-                and key != articulation_path
-                and not key.startswith("/" if articulation_path == "/" else f"{articulation_path}/")
-            ):
+            if key not in tree_body_paths:
                 continue
 
             usd_prim = stage.GetPrimAtPath(p)
