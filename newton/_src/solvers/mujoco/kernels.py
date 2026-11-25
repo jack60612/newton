@@ -1353,6 +1353,8 @@ def update_connect_constraint_anchors_kernel(
     mjc_eq_to_newton_jnt: wp.array2d[wp.int32],
     eq_constraint_type: wp.array[wp.int32],
     eq_constraint_anchor: wp.array[wp.vec3],
+    eq_constraint_anchor2: wp.array[wp.vec3],
+    eq_constraint_has_anchor2: wp.array[wp.int32],
     jnt_connect_hinge_side: wp.array2d[wp.int32],
     joint_X_p: wp.array[wp.transform],
     joint_axis: wp.array[wp.vec3],
@@ -1393,6 +1395,8 @@ def update_connect_constraint_anchors_kernel(
         return
 
     anchor2 = wp.transform_point(connect_X_rel[world, mjc_eq], anchor)
+    if newton_eq >= 0 and eq_constraint_has_anchor2[newton_eq] != 0:
+        anchor2 = eq_constraint_anchor2[newton_eq]
 
     data = eq_data_out[world, mjc_eq]
     data[0] = anchor[0]

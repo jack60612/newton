@@ -105,6 +105,26 @@ def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
     )
     builder.add_custom_attribute(
         ca(
+            name="equality_constraint_anchor2",
+            frequency=eq_freq,
+            assignment=model_assignment,
+            dtype=wp.vec3,
+            default=wp.vec3(),
+            namespace="mujoco",
+        )
+    )
+    builder.add_custom_attribute(
+        ca(
+            name="equality_constraint_has_anchor2",
+            frequency=eq_freq,
+            assignment=model_assignment,
+            dtype=wp.int32,
+            default=0,
+            namespace="mujoco",
+        )
+    )
+    builder.add_custom_attribute(
+        ca(
             name="equality_constraint_torquescale",
             frequency=eq_freq,
             assignment=model_assignment,
@@ -282,6 +302,7 @@ def _add_equality_constraint(
     enabled: bool = True,
     custom_attributes: dict[str, Any] | None = None,
     *,
+    anchor2: Vec3 | None = None,
     tendon1: int = -1,
     tendon2: int = -1,
     validate_custom_attributes: bool = False,
@@ -295,6 +316,8 @@ def _add_equality_constraint(
         body1: Index of the first body (-1 for world).
         body2: Index of the second body (-1 for world).
         anchor: Anchor point on body1. Defaults to the origin.
+        anchor2: Optional CONNECT anchor in body2's frame. If omitted, it
+            is inferred to coincide with anchor at the reference pose.
         torquescale: Angular residual scale for weld. Defaults to ``1.0`` for
             ``EqType.WELD`` and ``0.0`` otherwise.
         relpose: Relative pose of body2 for weld. Defaults to the identity transform.
@@ -327,6 +350,8 @@ def _add_equality_constraint(
         "mujoco:equality_constraint_body1": body1,
         "mujoco:equality_constraint_body2": body2,
         "mujoco:equality_constraint_anchor": anchor_vec,
+        "mujoco:equality_constraint_anchor2": axis_to_vec3(anchor2) if anchor2 is not None else wp.vec3(),
+        "mujoco:equality_constraint_has_anchor2": int(anchor2 is not None),
         "mujoco:equality_constraint_torquescale": torquescale_value,
         "mujoco:equality_constraint_relpose": relpose_tf,
         "mujoco:equality_constraint_joint1": joint1,
@@ -436,6 +461,7 @@ def add_equality_connect(
     body2: int = -1,
     *,
     anchor: Vec3 | None = None,
+    anchor2: Vec3 | None = None,
     label: str | None = None,
     enabled: bool = True,
     solref: Sequence[float] | None = None,
@@ -451,6 +477,8 @@ def add_equality_connect(
         body1: First body index, or ``-1`` for the world.
         body2: Second body index, or ``-1`` for the world.
         anchor: Anchor point in the first body's frame [m].
+        anchor2: Optional anchor in the second body's frame [m]. If omitted,
+            the second anchor coincides with the first at the reference pose.
         label: Optional constraint label.
         enabled: Whether the constraint is active.
         solref: Optional MuJoCo constraint reference parameters.
@@ -473,6 +501,7 @@ def add_equality_connect(
         body1=body1,
         body2=body2,
         anchor=anchor,
+        anchor2=anchor2,
         label=label,
         enabled=enabled,
         custom_attributes=_equality_custom_attributes(custom_attributes, solref, solimp),

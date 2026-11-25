@@ -4094,6 +4094,38 @@ class TestMuJoCoSolverGeomProperties(unittest.TestCase):
 
 
 class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
+    def test_connect_explicit_second_anchor_survives_refresh(self):
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        bodies = []
+        for position in ((1.0, 2.0, 3.0), (-1.0, 0.5, 2.0)):
+            body = builder.add_link(
+                xform=wp.transform(wp.vec3(*position), wp.quat_rpy(0.2, -0.3, 0.4)),
+                mass=1.0,
+                inertia=wp.mat33(np.eye(3)),
+            )
+            builder.add_articulation([builder.add_joint_free(child=body)])
+            bodies.append(body)
+        constraint = _add_equality_constraint(
+            builder,
+            constraint_type=SolverMuJoCo.EqType.CONNECT,
+            body1=bodies[0],
+            body2=bodies[1],
+            anchor=(0.1, 0.2, 0.3),
+            anchor2=(-0.4, 0.5, 0.6),
+        )
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, disable_contacts=True)
+        eq = np.flatnonzero(solver.mjc_eq_to_newton_eq.numpy()[0] == constraint)[0]
+        for flags in (None, ModelFlags.JOINT_PROPERTIES, ModelFlags.CONSTRAINT_PROPERTIES):
+            if flags is not None:
+                solver.notify_model_changed(flags)
+            np.testing.assert_allclose(
+                solver.mjw_model.eq_data.numpy()[0, eq, :6],
+                [0.1, 0.2, 0.3, -0.4, 0.5, 0.6],
+                atol=1e-6,
+            )
+
     def test_connect_standalone_root_reference_anchors(self):
         for movable in (False, True):
             with self.subTest(movable=movable):
