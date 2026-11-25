@@ -4094,6 +4094,35 @@ class TestMuJoCoSolverGeomProperties(unittest.TestCase):
 
 
 class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
+    def test_mjcf_site_connect_keeps_both_anchors(self):
+        mjcf = """
+        <mujoco>
+          <worldbody>
+            <body name="a" pos="1 2 3" euler="0 0 30">
+              <freejoint/><geom type="sphere" size=".1" mass="1"/>
+              <site name="s1" pos=".1 .2 .3"/>
+            </body>
+            <body name="b" pos="-1 1 2" euler="10 20 30">
+              <freejoint/><geom type="sphere" size=".1" mass="1"/>
+              <site name="s2" pos="-.4 .5 .6"/>
+            </body>
+          </worldbody>
+          <equality><connect site1="s1" site2="s2"/></equality>
+        </mujoco>
+        """
+        for convert in (False, True):
+            with self.subTest(convert=convert):
+                builder = newton.ModelBuilder()
+                SolverMuJoCo.register_custom_attributes(builder)
+                builder.add_mjcf(mjcf, parse_sites=True, convert_mjc_equality_constraints=convert)
+                solver = SolverMuJoCo(builder.finalize(device="cpu"), disable_contacts=True)
+                row = np.flatnonzero(solver.mjc_eq_to_newton_eq.numpy()[0] >= 0)[0]
+                np.testing.assert_allclose(
+                    solver.mjw_model.eq_data.numpy()[0, row, :6],
+                    [0.1, 0.2, 0.3, -0.4, 0.5, 0.6],
+                    atol=1e-6,
+                )
+
     def test_connect_explicit_second_anchor_survives_refresh(self):
         builder = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(builder)
@@ -4669,6 +4698,38 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
                         rtol=1e-5,
                         err_msg=f"Updated JOINT polycoef mismatch at World {w}, MuJoCo eq {mjc_eq}",
                     )
+
+    def test_explicit_connect_anchor_replicated_release(self):
+        template = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(template)
+        bodies = []
+        for _ in range(2):
+            body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+            template.add_articulation([template.add_joint_free(child=body)])
+            bodies.append(body)
+        _add_equality_constraint(
+            template,
+            SolverMuJoCo.EqType.CONNECT,
+            body1=bodies[0],
+            body2=bodies[1],
+            anchor=(0.1, 0.2, 0.3),
+            anchor2=(-0.4, 0.5, 0.6),
+        )
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.replicate(template, 2)
+        model = builder.finalize(device="cpu")
+        solver = SolverMuJoCo(model, disable_contacts=True)
+        mapping = solver.mjc_eq_to_newton_eq.numpy()
+        for enabled in ([True, True], [False, True], [True, True]):
+            model.mujoco.equality_constraint_enabled.assign(np.array(enabled, dtype=bool))
+            solver.notify_model_changed(ModelFlags.CONSTRAINT_PROPERTIES)
+            data = solver.mjw_model.eq_data.numpy()
+            active = solver.mjw_data.eq_active.numpy()
+            for world in range(2):
+                row = np.flatnonzero(mapping[world] >= 0)[0]
+                self.assertEqual(bool(active[world, row]), enabled[world])
+                np.testing.assert_allclose(data[world, row, 3:6], [-0.4, 0.5, 0.6], atol=1e-6)
 
     def test_eq_active_update_preserves_connect_anchor(self):
         """Toggle constraints per world without overwriting CONNECT's second anchor."""

@@ -2848,7 +2848,7 @@ def parse_mjcf(
                             logger.warning("Connect constraint '%s' failed.", common["name"])
                         continue
                     body1_idx, anchor_vec = site1_info
-                    body2_idx, _ = site2_info
+                    body2_idx, anchor2_vec = site2_info
                     if verbose:
                         logger.info(
                             "Connect constraint (site-based): site '%s' on body %s to body %s",
@@ -2856,28 +2856,19 @@ def parse_mjcf(
                             body1_idx,
                             body2_idx,
                         )
-                    if convert_mjc_equality_constraints:
-                        add_converted_loop_joint(
-                            EqType.CONNECT,
-                            body1_idx,
-                            body2_idx,
-                            anchor_vec,
-                            None,
-                            0.0,
-                            common,
-                            custom_attrs,
-                        )
-                    else:
-                        _add_equality_constraint(
-                            builder,
-                            constraint_type=EqType.CONNECT,
-                            body1=body1_idx,
-                            body2=body2_idx,
-                            anchor=anchor_vec,
-                            label=equality_label(common),
-                            enabled=common["active"],
-                            custom_attributes=custom_attrs,
-                        )
+                    # Sites describe two independent anchors; a converted loop
+                    # joint would reconstruct the second one as coincident.
+                    _add_equality_constraint(
+                        builder,
+                        constraint_type=EqType.CONNECT,
+                        body1=body1_idx,
+                        body2=body2_idx,
+                        anchor=anchor_vec,
+                        anchor2=anchor2_vec,
+                        label=equality_label(common),
+                        enabled=common["active"],
+                        custom_attributes=custom_attrs,
+                    )
                 else:
                     if verbose:
                         logger.warning(

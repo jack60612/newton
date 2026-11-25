@@ -2735,10 +2735,18 @@ def parse_usd(
                     # Rigid-body local poses remain authoritative; static/world
                     # endpoints already include their authored/import transforms.
                     anchor = wp.vec3(*joint_desc.localPose0Position) if target0 in path_body_map else site0_local_pos
+                    # A site target or an explicitly authored second local pose
+                    # carries an independent second anchor. Body-only connections
+                    # without one retain MuJoCo's coincident-anchor default.
+                    local_pos1_attr = UsdPhysics.Joint(joint_prim).GetLocalPos1Attr()
+                    has_anchor2 = bool(local_pos1_attr and local_pos1_attr.HasAuthoredValueOpinion()) or bool(
+                        target1 and target1 not in path_body_map
+                    )
+                    anchor2 = wp.vec3(*joint_desc.localPose1Position) if target1 in path_body_map else site1_local_pos
                     # Standalone static/world endpoints have no articulation loop
                     # target. Preserve their authoritative native equality instead.
                     convert_connect = convert_mjc_equality_constraints and not (
-                        body0_idx in static_equality_bodies or body1_idx in static_equality_bodies
+                        has_anchor2 or body0_idx in static_equality_bodies or body1_idx in static_equality_bodies
                     )
                     if convert_connect:
                         add_converted_loop_joint(
@@ -2759,6 +2767,7 @@ def parse_usd(
                             body1=body0_idx,
                             body2=body1_idx,
                             anchor=anchor,
+                            anchor2=anchor2 if has_anchor2 else None,
                             label=joint_path,
                             enabled=enabled,
                             custom_attributes=eq_custom_attrs,
