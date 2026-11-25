@@ -4699,6 +4699,40 @@ class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
                         err_msg=f"Updated JOINT polycoef mismatch at World {w}, MuJoCo eq {mjc_eq}",
                     )
 
+    def test_connect_world_anchor_follows_replicated_transform(self):
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                template = newton.ModelBuilder()
+                SolverMuJoCo.register_custom_attributes(template)
+                body = template.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+                template.add_articulation([template.add_joint_free(child=body)])
+                bodies = (-1, body) if reverse else (body, -1)
+                anchors = ((1.0, 2.0, 3.0), (-0.4, 0.5, 0.6))
+                _add_equality_constraint(
+                    template,
+                    SolverMuJoCo.EqType.CONNECT,
+                    body1=bodies[0],
+                    body2=bodies[1],
+                    anchor=anchors[0],
+                    anchor2=anchors[1],
+                )
+                xform = wp.transform(wp.vec3(4.0, -2.0, 1.0), wp.quat_rpy(0.2, -0.3, 0.4))
+                builder = newton.ModelBuilder()
+                SolverMuJoCo.register_custom_attributes(builder)
+                builder.replicate(template, 2, xforms=[wp.transform_identity(), xform])
+                model = builder.finalize(device="cpu")
+                solver = SolverMuJoCo(model, disable_contacts=True)
+                mapping = solver.mjc_eq_to_newton_eq.numpy()
+                data = solver.mjw_model.eq_data.numpy()
+                world_endpoint = 0 if reverse else 1
+                for world in range(2):
+                    row = np.flatnonzero(mapping[world] >= 0)[0]
+                    actual = data[world, row, 3 * world_endpoint : 3 * world_endpoint + 3]
+                    expected = wp.vec3(*anchors[world_endpoint])
+                    if world:
+                        expected = wp.transform_point(xform, expected)
+                    np.testing.assert_allclose(actual, np.asarray(expected), atol=1e-6)
+
     def test_explicit_connect_anchor_replicated_release(self):
         template = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(template)

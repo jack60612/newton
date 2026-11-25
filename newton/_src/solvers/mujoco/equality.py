@@ -42,6 +42,29 @@ MJC_OBJ_JOINT = 3
 MJC_OBJ_TENDON = 18
 
 
+def _transform_connect_world_anchor(values: list[Any], context: dict[str, Any], endpoint: int) -> list[Any]:
+    xform = context["xform"]
+    if xform is None:
+        return values
+    attrs = context["builder"].custom_attributes
+    types = attrs["mujoco:equality_constraint_type"].values
+    bodies = attrs[f"mujoco:equality_constraint_body{endpoint}"].values
+    return [
+        wp.transform_point(xform, value)
+        if value is not None and types[index] == int(EqType.CONNECT) and bodies[index] == -1
+        else value
+        for index, value in zip(context["row_indices"], values, strict=True)
+    ]
+
+
+def _transform_connect_anchor1(values: list[Any], context: dict[str, Any]) -> list[Any]:
+    return _transform_connect_world_anchor(values, context, 1)
+
+
+def _transform_connect_anchor2(values: list[Any], context: dict[str, Any]) -> list[Any]:
+    return _transform_connect_world_anchor(values, context, 2)
+
+
 def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
     """Declare the ``model.mujoco.equality_constraint_*`` custom-attribute rows on ``builder``.
 
@@ -101,6 +124,7 @@ def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
             dtype=wp.vec3,
             default=wp.vec3(),
             namespace="mujoco",
+            reference_value_transformer=_transform_connect_anchor1,
         )
     )
     builder.add_custom_attribute(
@@ -111,6 +135,7 @@ def _register_equality_constraint_attributes(builder: ModelBuilder) -> None:
             dtype=wp.vec3,
             default=wp.vec3(),
             namespace="mujoco",
+            reference_value_transformer=_transform_connect_anchor2,
         )
     )
     builder.add_custom_attribute(

@@ -4201,7 +4201,7 @@ class ModelBuilder:
         for copy_index, world in enumerate(worlds.tolist()):
             entity_offsets = {kind: int(starts(kind)[copy_index]) for kind in counts}
             self._merge_builder_custom_attributes(
-                builder, entity_offsets, world, label_prefixes[copy_index], custom_attributes
+                builder, entity_offsets, world, label_prefixes[copy_index], custom_attributes, xforms[copy_index]
             )
             self._merge_builder_actuators(
                 builder,
@@ -5468,6 +5468,7 @@ class ModelBuilder:
         world: int,
         label_prefix: str | None,
         attributes: dict[str, ModelBuilder.CustomAttribute],
+        xform: Transform | None,
     ) -> None:
         # Resolve existing destination rows, since its topology may have
         # changed since the rows were first added.
@@ -5551,6 +5552,7 @@ class ModelBuilder:
                         "row_indices": row_indices,
                         "world": world,
                         "label_prefix": label_prefix,
+                        "xform": xform,
                     },
                 )
                 if len(transformed) != len(row_values):
