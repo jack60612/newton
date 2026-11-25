@@ -636,7 +636,8 @@ array; slot layout depends on the constraint type.
      - Notes
    * - :attr:`~newton.solvers.SolverMuJoCo.EqType.CONNECT`
      - ``mjEQ_CONNECT``
-     - Anchor forwarded in ``data[0:3]``.
+     - Body-local anchors forwarded in ``data[0:3]`` and ``data[3:6]``.
+       The second anchor defaults to the first anchor's reference-pose position.
    * - :attr:`~newton.solvers.SolverMuJoCo.EqType.WELD`
      - ``mjEQ_WELD``
      - Anchor forwarded in ``data[0:3]``, relative pose in ``data[3:10]``,
@@ -671,6 +672,12 @@ then read or update finalized fields via
    from newton.solvers import mujoco
 
    mujoco.add_equality_connect(builder, body1, body2, anchor=(0.0, 0.0, 0.0))
+
+To specify an independent anchor in the second body's frame, pass
+``anchor2=(x, y, z)``. An omitted ``anchor2`` retains the coincident-anchor
+behavior. MJCF site-based connections and USD connections with an authored
+second pose preserve both endpoints. These anchors may differ at the reference
+pose, giving a soft equality a nonzero initial constraint force.
 
 The helpers write rows in the MuJoCo
 :ref:`custom-attribute namespace <mujoco-custom-attributes>`. The equivalent
