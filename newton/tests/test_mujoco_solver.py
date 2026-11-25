@@ -4094,6 +4094,33 @@ class TestMuJoCoSolverGeomProperties(unittest.TestCase):
 
 
 class TestMuJoCoSolverEqualityConstraintProperties(unittest.TestCase):
+    def test_explicit_connect_force_survives_reset_and_releases(self):
+        import mujoco
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        body = builder.add_link(mass=1.0, inertia=wp.mat33(np.eye(3)))
+        builder.add_articulation([builder.add_joint_free(child=body)])
+        constraint = _add_equality_constraint(
+            builder,
+            SolverMuJoCo.EqType.CONNECT,
+            body1=body,
+            body2=-1,
+            anchor=(0.0, 0.0, 0.0),
+            anchor2=(0.0, 0.0, 0.01),
+        )
+        solver = SolverMuJoCo(builder.finalize(device="cpu"), use_mujoco_cpu=True, disable_contacts=True)
+        row = np.flatnonzero(solver.mjc_eq_to_newton_eq.numpy()[0] == constraint)[0]
+        mujoco.mj_forward(solver.mj_model, solver.mj_data)
+        initial_force = solver.mj_data.qfrc_constraint.copy()
+        self.assertGreater(np.linalg.norm(initial_force), 0.0)
+        solver.mj_data.eq_active[row] = False
+        mujoco.mj_forward(solver.mj_model, solver.mj_data)
+        np.testing.assert_allclose(solver.mj_data.qfrc_constraint, 0.0, atol=1e-12)
+        mujoco.mj_resetData(solver.mj_model, solver.mj_data)
+        mujoco.mj_forward(solver.mj_model, solver.mj_data)
+        np.testing.assert_allclose(solver.mj_data.qfrc_constraint, initial_force, rtol=1e-6, atol=1e-12)
+
     def test_mjcf_site_connect_keeps_both_anchors(self):
         mjcf = """
         <mujoco>
