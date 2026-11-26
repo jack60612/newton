@@ -6639,6 +6639,23 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
         )
 
     @staticmethod
+    def _body_filters_requiring_excludes(model, colliding_shapes, body_filters, collision_type, collision_affinity):
+        """Keep only body exclusions not already enforced by the emitted geom masks."""
+        body_masks = {}
+        shape_body = model.shape_body.numpy()
+        for shape in colliding_shapes:
+            body = int(shape_body[shape])
+            if body < 0:
+                continue
+            contype, affinity = body_masks.get(body, (0, 0))
+            body_masks[body] = (contype | int(collision_type[shape]), affinity | int(collision_affinity[shape]))
+        for body_a, body_b in body_filters:
+            type_a, affinity_a = body_masks[int(body_a)]
+            type_b, affinity_b = body_masks[int(body_b)]
+            if (type_a & affinity_b) | (type_b & affinity_a):
+                yield body_a, body_b
+
+    @staticmethod
     def _find_body_collision_filter_pairs(
         model: Model,
         selected_bodies: np.ndarray,
@@ -9131,9 +9148,14 @@ class SolverMuJoCo(SolverBase, CouplingInterface):
                 "Make sure each body belongs to an articulation or has a standalone joint to world."
             )
 
-        # add contact exclusions between bodies to ensure parent <> child collisions are ignored
-        # even when one of the bodies is static
-        for b1, b2 in body_filters:
+        # Body exclusions already implied by geom masks need not be materialized
+        # in the MuJoCo spec. The OR of each body's geom masks preserves exactly
+        # whether any geom pair could pass MuJoCo's symmetric mask test.
+        collision_type = shape_mjc_contype if use_preserved_collision_masks else compiled_collision_type
+        collision_affinity = shape_mjc_conaffinity if use_preserved_collision_masks else compiled_collision_affinity
+        for b1, b2 in self._body_filters_requiring_excludes(
+            model, colliding_shapes, body_filters, collision_type, collision_affinity
+        ):
             mb1, mb2 = body_mapping[b1], body_mapping[b2]
             spec.add_exclude(bodyname1=mj_bodies[mb1].name, bodyname2=mj_bodies[mb2].name)
         for shape, body in static_body_filters:

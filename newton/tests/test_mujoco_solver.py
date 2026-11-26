@@ -3182,6 +3182,33 @@ class TestMuJoCoSolverKinematicBodyProperties(unittest.TestCase):
 
 
 class TestMuJoCoSolverCollisionMasks(unittest.TestCase):
+    def test_redundant_body_excludes_preserve_effective_geom_pairs(self):
+        class Array:
+            def numpy(self):
+                return np.array([0, 0, 1, 2, 3])
+
+        class ModelStub:
+            shape_body = Array()
+
+        shapes = np.arange(5)
+        types = np.array([1, 2, 4, 8, 16], dtype=np.uint32)
+        affinities = np.array([0, 4, 2, 0, 0], dtype=np.uint32)
+        filters = [(0, 1), (0, 2), (1, 2), (2, 3)]
+        retained = list(SolverMuJoCo._body_filters_requiring_excludes(ModelStub(), shapes, filters, types, affinities))
+        self.assertEqual(retained, [(0, 1)])
+
+        bodies = ModelStub.shape_body.numpy()
+        def effective(excludes):
+            return {
+                (a, b)
+                for a in shapes
+                for b in shapes[a + 1 :]
+                if bodies[a] != bodies[b]
+                and (min(bodies[a], bodies[b]), max(bodies[a], bodies[b])) not in excludes
+                and ((types[a] & affinities[b]) or (types[b] & affinities[a]))
+            }
+        self.assertEqual(effective(set(filters)), effective(set(retained)))
+
     def test_body_excludes_ignore_bodies_without_collision_shapes(self):
         class ModelStub:
             def __init__(self):
