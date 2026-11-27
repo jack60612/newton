@@ -1986,9 +1986,7 @@ def update_solver_options_kernel(
         # else: skip update, keep existing MuJoCo default value
 
     if newton_tolerance:
-        # MuJoCo Warp clamps tolerance to 1e-6 for float32 precision
-        # See mujoco_warp/_src/io.py: opt.tolerance = max(opt.tolerance, 1e-6)
-        opt_tolerance[worldid] = wp.max(newton_tolerance[worldid], 1.0e-6)
+        opt_tolerance[worldid] = newton_tolerance[worldid]
 
     if newton_ls_tolerance:
         opt_ls_tolerance[worldid] = newton_ls_tolerance[worldid]

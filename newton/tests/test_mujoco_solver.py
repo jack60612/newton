@@ -8521,6 +8521,13 @@ class TestMuJoCoOptions(unittest.TestCase):
             msg=f"impratio=2.0 should produce valid impratio_invsqrt={expected_invsqrt}",
         )
 
+    def test_per_world_tolerance_below_float32_clamp(self):
+        model = self._create_multiworld_model(world_count=2)
+        values = np.array([1e-8, 1e-7], dtype=np.float32)
+        model.mujoco.tolerance.assign(values)
+        solver = SolverMuJoCo(model, disable_contacts=True)
+        np.testing.assert_allclose(solver.mjw_model.opt.tolerance.numpy(), values, rtol=1e-6, atol=0)
+
     def test_options_use_custom_attributes(self):
         """Resolve enum, iteration, and shared numeric options from custom attributes."""
         model = self._create_multiworld_model(world_count=3)
